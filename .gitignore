@@ -1,0 +1,9 @@
+# The built framework in go/ is a staging copy — the committed one lives in
+# ios/TailscaleEmbed.xcframework (checked in so git consumers get a working
+# pod without building Go; ~92MB, under GitHub's 100MB limit).
+go/TailscaleEmbed.xcframework/
+
+.dart_tool/
+.packages
+build/
+pubspec.lock
