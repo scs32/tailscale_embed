@@ -76,7 +76,19 @@ class _SettingsPageState extends State<SettingsPage> {
         // node identity is reused and the key may even be left empty.
         await embed.stop();
         final port = await embed.start();
-        setState(() => _status = 'Connected — local proxy on port $port');
+        final st = await embed.status();
+        final self = st?.self;
+        setState(() {
+          _status = self != null
+              ? 'Connected as '
+                  '${self.dnsName.isNotEmpty ? self.dnsName : self.hostName} '
+                  '(${self.ips.join(', ')}) — '
+                  '${st!.onlinePeerCount}/${st.peers.length} peers online, '
+                  'proxy on port $port'
+              : 'Connected — local proxy on port $port';
+          // onKeyConsumed cleared the stored key; reflect that in the field.
+          _keyController.text = Settings.instance.authKey;
+        });
       } else {
         await embed.stop();
         setState(() => _status = 'Tailscale disabled');

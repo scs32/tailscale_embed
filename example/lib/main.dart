@@ -19,6 +19,9 @@ Future<void> main() async {
     // Route WKWebView traffic through the embedded node's local proxy
     // (re-applied automatically whenever the node starts or rebinds).
     webViewProxy: true,
+    // The node identity persists after first registration, so the plaintext
+    // auth key is no longer needed — delete it from storage.
+    onKeyConsumed: () => Settings.instance.authKey = '',
   );
 
   runApp(const BrowserApp());
