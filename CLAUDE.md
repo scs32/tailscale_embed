@@ -1,9 +1,31 @@
 # tailscale_embed — session notes
 
-## Multi-identity session (2026-07-19, later): identities landed
+## Multi-identity session (2026-07-19, later): identities landed & pushed
 
-Tailarr's feature request implemented and committed: multiple node
-identities, one per app profile.
+Tailarr's feature request implemented, committed (`efc0e02`) and PUSHED to
+github.com/scs32/tailscale_embed main — ready for Tailarr to consume as a
+git dep. Session ended cleanly: example app uninstalled from the sim,
+`ts-browser-test` shut down (reuse it for real-key testing).
+
+### Next session, in order
+1. Real-key end-to-end (needs user's fresh `tskey-auth-…` × 2): enroll
+   `default`, then a second identity (`work`, same tailnet fine —
+   hostname auto-defaults to `ts-browser-work`), switch between them via
+   the enrolled-identities list + Apply, confirm `status().identity`
+   tracks, key field self-empties (onKeyConsumed), deleting the active
+   identity errors IDENTITY_ACTIVE. Also still outstanding from the
+   previous backlog: browse a `*.ts.net` host + a public site, subnet
+   route hit.
+2. Framework distribution (GitHub Releases + script_phase, decided
+   earlier — see previous session's item 3): the push warned GH001 large
+   files for the two ~90MB xcframework binaries; do this before Tailarr
+   bumps multiply clone cost.
+3. Tailarr side: per-profile TAILSCALE_* fields, `identity: <profileSlug>`
+   (slugify! names are validated `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`),
+   `ensure()` on profile switch, adopt `onKeyConsumed(identity)`
+   (signature is BREAKING vs the old zero-arg one).
+
+### What landed (detail)
 
 - `TailscaleConfig.identity` (default `'default'`): logical label
   (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`), validated in Swift; the plugin owns
@@ -35,11 +57,8 @@ identities, one per app profile.
 - xcframework rebuilt; `go test` green, `flutter analyze` clean (both),
   sim-verified WITHOUT real keys: legacy migration (seeded fake
   `tailscaled.state` moved to `identities/default`), listIdentities,
-  per-identity settings, deleteIdentity. Sim app uninstalled again,
-  `ts-browser-test` shut down.
-- NOT yet verified (needs real `tskey-auth-…`, same as existing pending
-  item): enrolling two identities, live switch with `status().identity`,
-  rollback-on-bad-key, onKeyConsumed attribution.
+  per-identity settings, deleteIdentity. Real-key items are "Next
+  session" item 1 above.
 
 ### Coordination
 - **Tailarr** consumes multi-identity in its next plugin bump alongside
