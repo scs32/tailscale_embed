@@ -51,6 +51,20 @@ was the input to this session and is now fully processed/stale.
    exercise acceptRoutes.
 2. Then: back to the original goal — fork apps (e.g. Immich) around this
    package from a consumer session.
+3. **Framework distribution** (decided, not yet built): move the ~92MB×2
+   xcframework binaries out of git and fetch at build time.
+   - `go/build.sh` gains a `gh release create` step: zip the xcframework +
+     SHA-256, tag `framework-v<tailscale version>` on GitHub Releases.
+   - Podspec downloads via a CocoaPods `script_phase` (before compile) with
+     checksum pinning — NOT `prepare_command` (skipped for development
+     pods, which Flutter plugins are). Cache after first build.
+   - Repo keeps Go source + pinned version/checksum + download script;
+     `go/build.sh` stays the offline from-source path.
+   - Rejected: Git LFS (consumers without git-lfs get pointer files via
+     `dart pub` git deps + bandwidth quotas); pub.dev (100MB compressed
+     limit too close).
+   - Optional while sole consumer: `git filter-repo` to purge the two big
+     blobs already in history (force-push decision).
 
 ### Gotchas
 - gvisor must match tailscale.com's go.mod pin or `gomobile bind` breaks
