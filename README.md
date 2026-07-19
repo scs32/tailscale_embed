@@ -30,6 +30,15 @@ has been running in production on iOS since July 2026.
   `WKWebsiteDataStore.proxyConfigurations` so webview traffic — which
   bypasses Dart's `HttpClient` entirely — also flows through the embedded
   node. Re-applied automatically on every start/rebind.
+- **Subnet routes** (`acceptRoutes`, default true): destinations inside
+  peer-advertised routes (e.g. `192.168.1.0/24` behind a subnet router)
+  dial through the tailnet, so they work away from home too. At worst a
+  same-LAN destination hairpins through its router; set
+  `acceptRoutes: false` to dial LAN-looking IPs directly instead.
+  Exit-node default routes (`0.0.0.0/0`) are never inferred.
+- **Transactional restarts**: if a re-start with new settings fails (bad
+  auth key, timeout), the plugin rolls back to the previously-working node
+  instead of leaving the user with no tunnel.
 
 ## Usage
 
@@ -53,11 +62,39 @@ void main() {
 }
 ```
 
-The node is **persistent** (`Ephemeral: false`): the auth key is needed
-exactly once; the identity survives restarts like a normal device, so
-single-use keys are fine. Use `TailscaleAuthKeys.typeError()` to reject
-API tokens / OAuth secrets before dialing, and
-`TailscaleAuthKeys.friendlyError()` to translate tsnet failures.
+The node is **persistent** by default (`ephemeral: false`): the auth key is
+needed exactly once; the identity survives restarts like a normal device, so
+single-use keys are fine. Pass `onKeyConsumed:` to `configure()` to be told
+when the key has done its job — then **delete it from your settings store**
+so a plaintext `tskey-auth-…` doesn't linger (the example app does this).
+`TailscaleConfig` also exposes `ephemeral`, `upTimeout` (default 45s), and
+`acceptRoutes`.
+
+### Status
+
+`TailscaleEmbed.instance.status()` returns a `TailscaleStatus` snapshot for
+settings pages and connection indicators: backend state, health warnings,
+tailnet name / MagicDNS suffix, self node (hostname, DNS name, IPs), and the
+peer list with per-peer online state and advertised routes.
+
+### Errors
+
+Failures carry **stable error codes** end-to-end (emitted in Go, parsed into
+`PlatformException.code`): `AUTH_TIMEOUT`, `AUTH_KEY_INVALID`,
+`AUTH_KEY_WRONG_TYPE`, `START_FAILED`, `PROXY_BIND_FAILED`, `NOT_RUNNING` —
+see `TailscaleErrorCodes`. Use `TailscaleAuthKeys.typeError()` to reject API
+tokens / OAuth secrets before dialing, and
+`TailscaleAuthKeys.friendlyError()` to translate failures for humans (it
+prefers the codes, falling back to message text).
+
+### Node identity and backups
+
+The node key (its tailnet identity) lives in the app's Application Support
+directory, which is **included in device and iCloud backups**. That is a
+deliberate choice: restoring a backup restores the tailnet identity, so the
+app reconnects without a new auth key. If that doesn't fit your threat
+model, use `ephemeral: true` (no persisted identity, key required every
+start) or exclude the `tailscale/` state directory from backups in your app.
 
 ## Example app
 
