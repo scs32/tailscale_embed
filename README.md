@@ -22,6 +22,14 @@ has been running in production on iOS since July 2026.
   (iOS reclaims sockets during suspension) behind a blocking overlay.
 - MagicDNS names are resolved **on-device from the node's peer list** — the
   phone has no system MagicDNS, so the proxy does it itself.
+- The proxy carries **all** traffic, not just tailnet traffic: tailnet
+  destinations (peer names, `100.64.0.0/10`, `fd7a:115c:a1e0::/48`) are
+  dialed through tsnet, everything else through the system dialer. This
+  lets a webview point at the proxy wholesale.
+- **WKWebView support** (`webViewProxy: true`, iOS 17+): sets
+  `WKWebsiteDataStore.proxyConfigurations` so webview traffic — which
+  bypasses Dart's `HttpClient` entirely — also flows through the embedded
+  node. Re-applied automatically on every start/rebind.
 
 ## Usage
 
@@ -50,6 +58,17 @@ exactly once; the identity survives restarts like a normal device, so
 single-use keys are fine. Use `TailscaleAuthKeys.typeError()` to reject
 API tokens / OAuth secrets before dialing, and
 `TailscaleAuthKeys.friendlyError()` to translate tsnet failures.
+
+## Example app
+
+`example/` is a minimal **browser**: a WKWebView (`webview_flutter`) whose
+traffic rides through the embedded node via `webViewProxy: true`. Paste an
+auth key in its settings, then browse to MagicDNS names, `*.ts.net` FQDNs,
+tailnet IPs — or the regular web, which the proxy dials directly.
+
+```sh
+cd example && flutter run
+```
 
 ## Platforms
 
