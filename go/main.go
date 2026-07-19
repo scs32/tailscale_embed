@@ -177,27 +177,46 @@ func (t *Tailscale) GetPort() int {
 	return t.proxyPort
 }
 
-// resolveTailnet turns a "host:port" into an "ip:port" that tsnet can dial.
+// tailnetCGNAT / tailnetULA are the address ranges Tailscale assigns to
+// nodes; destinations inside them must be dialed through tsnet, anything
+// else is dialed directly (the proxy carries ALL traffic when a webview is
+// pointed at it, not just tailnet traffic).
+var (
+	tailnetCGNAT = netip.MustParsePrefix("100.64.0.0/10")
+	tailnetULA   = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+)
+
+func isTailnetIP(host string) bool {
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return tailnetCGNAT.Contains(addr) || tailnetULA.Contains(addr.Unmap())
+}
+
+// resolveTailnet turns a "host:port" into an "ip:port" that tsnet can dial
+// and reports whether the destination belongs to the tailnet.
 // The device has no system-wide MagicDNS (that's the whole point of the
 // in-app node), so *.ts.net FQDNs and MagicDNS short names won't resolve via
 // the OS. We resolve them ourselves from the node's own peer list. IP
-// literals and non-tailnet names pass through unchanged.
-func (t *Tailscale) resolveTailnet(ctx context.Context, hostport string) string {
+// literals and non-tailnet names pass through unchanged and are dialed
+// directly via the system dialer.
+func (t *Tailscale) resolveTailnet(ctx context.Context, hostport string) (string, bool) {
 	host, port, err := net.SplitHostPort(hostport)
 	if err != nil {
-		return hostport // no port; leave as-is
+		return hostport, false // no port; leave as-is
 	}
 	if net.ParseIP(host) != nil {
-		return hostport // already an IP
+		return hostport, isTailnetIP(host) // already an IP
 	}
 
 	lc, err := t.server.LocalClient()
 	if err != nil {
-		return hostport
+		return hostport, false
 	}
 	st, err := lc.Status(ctx)
 	if err != nil {
-		return hostport
+		return hostport, false
 	}
 
 	want := strings.TrimSuffix(strings.ToLower(host), ".")
@@ -213,17 +232,28 @@ func (t *Tailscale) resolveTailnet(ctx context.Context, hostport string) string 
 	}
 	if st.Self != nil {
 		if r := match(st.Self.DNSName, st.Self.HostName, st.Self.TailscaleIPs); r != "" {
-			return r
+			return r, true
 		}
 	}
 	for _, p := range st.Peer {
 		if r := match(p.DNSName, p.HostName, p.TailscaleIPs); r != "" {
 			log.Printf("[proxy] resolved %s -> %s", host, r)
-			return r
+			return r, true
 		}
 	}
-	log.Printf("[proxy] no tailnet peer matched %q; dialing name directly", host)
-	return hostport
+	return hostport, false
+}
+
+// dial resolves the destination and dials it through tsnet when it belongs
+// to the tailnet, or directly via the system dialer otherwise (system DNS
+// resolves non-tailnet names).
+func (t *Tailscale) dial(ctx context.Context, network, hostport string) (net.Conn, error) {
+	dest, viaTailnet := t.resolveTailnet(ctx, hostport)
+	if viaTailnet {
+		return t.server.Dial(ctx, network, dest)
+	}
+	var d net.Dialer
+	return d.DialContext(ctx, network, dest)
 }
 
 // handleProxy handles HTTP CONNECT requests for proxying through Tailscale.
@@ -238,10 +268,10 @@ func (t *Tailscale) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 // handleConnect handles HTTPS CONNECT tunneling.
 func (t *Tailscale) handleConnect(w http.ResponseWriter, r *http.Request) {
-	// Dial the destination through Tailscale, resolving MagicDNS names from
-	// the peer list first (no system-wide MagicDNS on this device).
-	dest := t.resolveTailnet(r.Context(), r.Host)
-	destConn, err := t.server.Dial(r.Context(), "tcp", dest)
+	// Dial the destination — through Tailscale for tailnet hosts (resolving
+	// MagicDNS names from the peer list; no system-wide MagicDNS on this
+	// device), directly for everything else.
+	destConn, err := t.dial(r.Context(), "tcp", r.Host)
 	if err != nil {
 		log.Printf("[proxy] CONNECT dial %s failed: %v", r.Host, err)
 		http.Error(w, fmt.Sprintf("failed to dial: %v", err), http.StatusBadGateway)
@@ -290,14 +320,11 @@ func (t *Tailscale) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	outReq := r.Clone(r.Context())
 	outReq.RequestURI = ""
 
-	// Dial through tsnet, resolving MagicDNS names from the peer list (the
-	// device has no system-wide MagicDNS). The original Host header is left
-	// intact so the destination still sees its own name.
+	// Dial through tsnet for tailnet hosts, directly otherwise. The original
+	// Host header is left intact so the destination still sees its own name.
 	httpClient := &http.Client{
 		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return t.server.Dial(ctx, network, t.resolveTailnet(ctx, addr))
-			},
+			DialContext: t.dial,
 		},
 	}
 	resp, err := httpClient.Do(outReq)
