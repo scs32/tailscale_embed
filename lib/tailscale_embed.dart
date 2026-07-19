@@ -12,3 +12,4 @@ export 'src/config.dart';
 export 'src/embed.dart';
 export 'src/guard.dart';
 export 'src/method_channel_backend.dart';
+export 'src/status.dart';

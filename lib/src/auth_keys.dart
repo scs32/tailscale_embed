@@ -1,3 +1,30 @@
+import 'package:flutter/services.dart';
+
+/// Stable error codes emitted by the native side (originating in the Go
+/// layer as `tsembed:CODE:` prefixes, parsed into `PlatformException.code`).
+/// Match on these, not on error message text.
+class TailscaleErrorCodes {
+  const TailscaleErrorCodes._();
+
+  /// Control plane unreachable or authentication timed out.
+  static const authTimeout = 'AUTH_TIMEOUT';
+
+  /// The auth key is invalid, expired, or already used.
+  static const authKeyInvalid = 'AUTH_KEY_INVALID';
+
+  /// An API token / OAuth secret was supplied instead of a node auth key.
+  static const authKeyWrongType = 'AUTH_KEY_WRONG_TYPE';
+
+  /// Any other tsnet startup failure.
+  static const startFailed = 'START_FAILED';
+
+  /// The local proxy listener could not be bound.
+  static const proxyBindFailed = 'PROXY_BIND_FAILED';
+
+  /// The operation requires a running node.
+  static const notRunning = 'NOT_RUNNING';
+}
+
 /// Auth-key validation and human-readable error mapping for tsnet failures.
 class TailscaleAuthKeys {
   const TailscaleAuthKeys._();
@@ -21,20 +48,35 @@ class TailscaleAuthKeys {
   }
 
   /// Translates tsnet/platform errors into something a person can act on.
+  /// Prefers the stable [TailscaleErrorCodes] carried in
+  /// [PlatformException.code]; falls back to matching error text for errors
+  /// that didn't come through the platform channel.
   static String friendlyError(Object error) {
+    final code = error is PlatformException ? error.code : null;
     final raw = error.toString();
-    if (raw.contains('cannot be used for node auth')) {
+
+    if (code == TailscaleErrorCodes.authKeyWrongType ||
+        raw.contains('cannot be used for node auth')) {
       return 'That key cannot register a device — use an Auth key '
           '(tskey-auth-…) from Settings > Keys. Toggle again to retry.';
     }
-    if (raw.contains('invalid key')) {
+    if (code == TailscaleErrorCodes.authKeyInvalid ||
+        raw.contains('invalid key')) {
       return 'The auth key is invalid, expired, or already used. Generate a '
           'new one and toggle again.';
     }
-    if (raw.contains('timeout') || raw.contains('deadline')) {
+    if (code == TailscaleErrorCodes.authTimeout ||
+        raw.contains('timeout') ||
+        raw.contains('deadline')) {
       return 'Timed out reaching Tailscale — check your connection and '
           'toggle again.';
     }
-    return 'Could not connect ($raw). Toggle again to retry with a new key.';
+    if (code == TailscaleErrorCodes.notRunning) {
+      return 'The embedded Tailscale node is not running. Toggle it on '
+          'to reconnect.';
+    }
+    final detail =
+        error is PlatformException ? (error.message ?? raw) : raw;
+    return 'Could not connect ($detail). Toggle again to retry with a new key.';
   }
 }

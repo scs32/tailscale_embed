@@ -1,3 +1,6 @@
+import 'config.dart';
+import 'status.dart';
+
 /// A platform implementation of the embedded Tailscale node + local proxy.
 ///
 /// The default is [MethodChannelTailscaleBackend] (Go tsnet via gomobile,
@@ -8,8 +11,9 @@ abstract class TailscaleBackend {
   bool get isSupported;
 
   /// Start the node (blocking until authenticated) and the local proxy.
-  /// Returns the proxy port. Throws with a platform error on auth failure.
-  Future<int> start(String authKey, String hostname);
+  /// Returns the proxy port. Throws with a platform error on auth failure —
+  /// see [TailscaleErrorCodes] for the stable codes.
+  Future<int> start(TailscaleConfig config);
 
   /// Health-check the local proxy listener and rebind it if the OS reclaimed
   /// it. Returns the current port, or null if the node is not running.
@@ -21,6 +25,11 @@ abstract class TailscaleBackend {
   Future<bool> isRunning();
 
   Future<int?> getPort();
+
+  /// A snapshot of the node's state (tailnet IPs, DNS name, backend state,
+  /// peers) for consumer UIs. Returns null when the backend has no status
+  /// support; a `TailscaleStatus(running: false)` when the node is stopped.
+  Future<TailscaleStatus?> status() async => null;
 
   /// Point the platform's system webview (WKWebView on iOS) at the local
   /// proxy on [port], so webview traffic reaches the tailnet too. The proxy

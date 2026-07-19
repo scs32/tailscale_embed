@@ -1,6 +1,7 @@
 import 'backend.dart';
 import 'config.dart';
 import 'method_channel_backend.dart';
+import 'status.dart';
 
 /// Singleton facade over the embedded Tailscale node.
 ///
@@ -19,6 +20,7 @@ class TailscaleEmbed {
 
   int? _proxyPort;
   bool _webViewProxy = false;
+  void Function()? _onKeyConsumed;
 
   /// The local proxy port, or null when the node is not running.
   int? get proxyPort => _proxyPort;
@@ -32,13 +34,20 @@ class TailscaleEmbed {
   /// [webViewProxy]: also point the platform's system webview (WKWebView)
   /// at the local proxy whenever the node (re)starts or rebinds, so webview
   /// traffic reaches the tailnet too. Requires iOS 17+.
+  ///
+  /// [onKeyConsumed]: fired after a start succeeded while an auth key was
+  /// configured — the key has served its purpose (the node identity now
+  /// persists on disk) and can be deleted from your settings store, so a
+  /// plaintext `tskey-auth-…` doesn't linger where it could leak.
   void configure({
     required TailscaleConfigProvider config,
     TailscaleBackend? backend,
     bool webViewProxy = false,
+    void Function()? onKeyConsumed,
   }) {
     _config = config;
     _webViewProxy = webViewProxy;
+    _onKeyConsumed = onKeyConsumed;
     if (backend != null) _backend = backend;
   }
 
@@ -46,8 +55,12 @@ class TailscaleEmbed {
   /// authenticated (tsnet `Up()`), so auth failures surface here.
   Future<int> start() async {
     final cfg = config;
-    final port = await _backend.start(cfg.authKey, cfg.hostname);
+    final port = await _backend.start(cfg);
     await _adoptPort(port);
+    // The node is up, so its persisted identity exists — the auth key (if
+    // one was set) has been consumed or is no longer needed. Ephemeral
+    // nodes keep needing the key on every start.
+    if (cfg.authKey.isNotEmpty && !cfg.ephemeral) _onKeyConsumed?.call();
     return port;
   }
 
@@ -73,4 +86,9 @@ class TailscaleEmbed {
   }
 
   Future<bool> isRunning() => _backend.isRunning();
+
+  /// A snapshot of the node's state (IPs, DNS name, backend state, peers)
+  /// for settings pages and connection indicators. Null when the backend
+  /// doesn't support status.
+  Future<TailscaleStatus?> status() => _backend.status();
 }

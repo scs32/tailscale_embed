@@ -8,6 +8,20 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
     private var tailscale: TsembedTailscale?
     private var proxyPort: Int?
 
+    private struct StartConfig {
+        let authKey: String
+        let hostname: String
+        let ephemeral: Bool
+        let upTimeoutSeconds: Int
+        let acceptRoutes: Bool
+    }
+
+    /// The config of the last successful start — used to roll the node back
+    /// when a re-start with new settings (e.g. a bad auth key) fails, so a
+    /// working node isn't torn down for nothing. The persisted identity
+    /// makes the rollback start succeed even with a consumed key.
+    private var lastGoodConfig: StartConfig?
+
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(
             name: "com.tailarr.tailscale_embed/method",
@@ -27,6 +41,8 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
             handleEnsure(result: result)
         case "isRunning":
             result(tailscale?.isRunning() ?? false)
+        case "status":
+            handleStatus(result: result)
         case "installWebViewProxy":
             handleInstallWebViewProxy(call: call, result: result)
         case "getPort":
@@ -40,6 +56,28 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
         }
     }
 
+    /// The Go layer prefixes errors with "tsembed:CODE: " so a stable code
+    /// survives the gomobile→NSError trip. Parse it into FlutterError.code;
+    /// fall back to the given code for errors without a prefix.
+    private func flutterError(_ error: Error, fallbackCode: String) -> FlutterError {
+        let msg = error.localizedDescription
+        if let match = msg.range(of: #"tsembed:([A-Z_]+): "#, options: .regularExpression) {
+            let tagged = String(msg[match])  // "tsembed:CODE: "
+            let code = String(tagged.dropFirst("tsembed:".count).dropLast(2))
+            let detail = String(msg[match.upperBound...])
+            return FlutterError(code: code, message: detail, details: nil)
+        }
+        return FlutterError(code: fallbackCode, message: msg, details: nil)
+    }
+
+    private func makeInstance(stateDir: String, config: StartConfig) -> TsembedTailscale? {
+        let instance = TsembedNewTailscale(stateDir, config.authKey, config.hostname)
+        instance?.setEphemeral(config.ephemeral)
+        instance?.setUpTimeoutSeconds(config.upTimeoutSeconds)
+        instance?.setAcceptRoutes(config.acceptRoutes)
+        return instance
+    }
+
     private func handleStart(call: FlutterMethodCall, result: @escaping FlutterResult) {
         guard let args = call.arguments as? [String: Any],
               let authKey = args["authKey"] as? String else {
@@ -50,7 +88,13 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
             ))
             return
         }
-        let hostname = args["hostname"] as? String ?? ""
+        let config = StartConfig(
+            authKey: authKey,
+            hostname: args["hostname"] as? String ?? "",
+            ephemeral: args["ephemeral"] as? Bool ?? false,
+            upTimeoutSeconds: args["upTimeoutSeconds"] as? Int ?? 45,
+            acceptRoutes: args["acceptRoutes"] as? Bool ?? true
+        )
 
         guard let stateDir = stateDirectory() else {
             result(FlutterError(
@@ -61,30 +105,52 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
             return
         }
 
-        // Stop existing instance if running
+        // Stop existing instance if running. tsnet instances share the state
+        // dir, so the old node must stop before the new one starts; if the
+        // new one fails, we roll back to the last good config below.
         if tailscale?.isRunning() == true {
             tailscale?.stopProxy()
         }
 
-        let instance = TsembedNewTailscale(stateDir, authKey, hostname)
+        let instance = makeInstance(stateDir: stateDir, config: config)
         tailscale = instance
 
-        // StartProxy blocks until the node is authenticated (up to ~45s) —
-        // keep it off the main thread.
+        // StartProxy blocks until the node is authenticated (up to the
+        // configured timeout) — keep it off the main thread.
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 var port: Int = 0
                 try instance?.startProxy(&port)
                 DispatchQueue.main.async {
                     self.proxyPort = port
+                    self.lastGoodConfig = config
                     result(port)
                 }
             } catch {
+                let flutterErr = self.flutterError(error, fallbackCode: "START_FAILED")
+                // Roll back: restart the previously-working node so a bad
+                // new key doesn't leave the user with no tunnel at all.
+                var rolledBack = false
+                if let lastGood = self.lastGoodConfig,
+                   let fallback = self.makeInstance(stateDir: stateDir, config: lastGood) {
+                    var port: Int = 0
+                    if (try? fallback.startProxy(&port)) != nil {
+                        rolledBack = true
+                        DispatchQueue.main.async {
+                            self.tailscale = fallback
+                            self.proxyPort = port
+                        }
+                    }
+                }
                 DispatchQueue.main.async {
+                    if !rolledBack {
+                        self.tailscale = nil
+                        self.proxyPort = nil
+                    }
                     result(FlutterError(
-                        code: "START_FAILED",
-                        message: error.localizedDescription,
-                        details: nil
+                        code: flutterErr.code,
+                        message: flutterErr.message,
+                        details: ["rolledBack": rolledBack]
                     ))
                 }
             }
@@ -107,11 +173,27 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
                 }
             } catch {
                 DispatchQueue.main.async {
-                    result(FlutterError(
-                        code: "ENSURE_FAILED",
-                        message: error.localizedDescription,
-                        details: nil
-                    ))
+                    result(self.flutterError(error, fallbackCode: "ENSURE_FAILED"))
+                }
+            }
+        }
+    }
+
+    private func handleStatus(result: @escaping FlutterResult) {
+        guard let instance = tailscale else {
+            result("{\"running\":false}")
+            return
+        }
+        // StatusJSON talks to the tsnet LocalClient — keep it off the main
+        // thread like the other blocking calls.
+        DispatchQueue.global(qos: .userInitiated).async {
+            var statusError: NSError?
+            let json = instance.statusJSON(&statusError)
+            DispatchQueue.main.async {
+                if let statusError {
+                    result(self.flutterError(statusError, fallbackCode: "STATUS_FAILED"))
+                } else {
+                    result(json)
                 }
             }
         }
