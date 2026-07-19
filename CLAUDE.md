@@ -1,53 +1,64 @@
 # tailscale_embed — session notes
 
-## Browser example session (2026-07-19) — PAUSED, uncommitted
+## Maintainer session (2026-07-19): backlog worked, all committed
 
-Goal: prove the embedded-Tailscale stack in a minimal browser app before
-forking bigger apps (e.g. Immich) around it.
+The browser-example integration work AND the resulting improvement backlog
+are done and committed on main (through `fcd9c2d`). HANDOFF.md (untracked)
+was the input to this session and is now fully processed/stale.
 
-### Done (all uncommitted on main — review `git diff` / untracked `example/`)
-- **go/main.go**: proxy now routes tailnet destinations (peer-list matches,
-  100.64.0.0/10, fd7a:115c:a1e0::/48) via tsnet and dials everything else
-  directly — so a webview can send it ALL traffic. New `dial()` helper;
-  `resolveTailnet` returns `(dest, viaTailnet)`.
-- **xcframework rebuilt** (go/build.sh) with that change and checked in place.
-- **Plugin**: new `installWebViewProxy` method — Swift sets
-  `WKWebsiteDataStore.default().proxyConfigurations` (iOS 17+) to the local
-  CONNECT proxy. Dart: `TailscaleBackend.installWebViewProxy(port)` (no-op
-  default) + `webViewProxy: true` flag on `TailscaleEmbed.configure()` that
-  auto-reapplies after every start/ensure (port changes on iOS rebind).
-- **example/**: browser app (`tailscale_browser`, org com.tailarr) —
-  `main.dart` (configure + TailscaleGuard), `browser_page.dart`
-  (webview_flutter, URL bar guessing http:// for tailnet-looking hosts /
-  https:// otherwise, connection dot, last-URL restore), `settings.dart`
-  (SharedPreferences: enabled/authKey/hostname + settings page with
-  TailscaleAuthKeys validation).
-- README updated (all-traffic proxy, webViewProxy, example app).
-
-### Verified
-- `go vet` + `go build` clean; `flutter analyze` clean.
-- `flutter build ios --simulator` succeeded (Runner.app builds and links).
+### Landed this session
+- Committed the prior session's work: all-traffic proxy routing, WKWebView
+  proxy support (`webViewProxy: true`, iOS 17+), `example/` browser app.
+- **Status API**: Go `StatusJSON()` → `TailscaleEmbed.instance.status()` →
+  `TailscaleStatus`/`TailscaleNode` (backend state, health, tailnet, self,
+  peers with online + advertised routes).
+- **Stable error codes**: Go prefixes errors `tsembed:CODE:`; Swift parses
+  into `FlutterError.code`; Dart `TailscaleErrorCodes` +
+  `friendlyError()` prefers codes, substring match is fallback only.
+- **Status cache**: `LocalClient().Status()` cached 3s (was per-dial).
+- **Shared transport** for plain-HTTP proxying; proxy now relays redirects
+  (`ErrUseLastResponse`) instead of following them.
+- **Config**: `TailscaleConfig` gains `ephemeral`, `upTimeout` (45s
+  default), `acceptRoutes`. BREAKING for custom backends:
+  `TailscaleBackend.start(TailscaleConfig)` replaces `(authKey, hostname)`.
+- **Subnet routes** (decision made): destinations inside peer-advertised
+  routes dial via tsnet by default (`acceptRoutes: true`; RouteAll enabled
+  after Up). Always correct remotely; hairpins at home. 0/0 exit-node
+  routes deliberately never inferred.
+- **Rollback start**: Swift keeps the last good config; a failed re-start
+  (bad key etc.) restarts the previous identity instead of leaving no
+  tunnel. Error details carry `rolledBack: true`.
+- **onKeyConsumed**: `configure(onKeyConsumed:)` fires after a successful
+  start with a key on a persistent node → app deletes the plaintext key
+  (example does this).
+- **Go unit tests** (`go/main_test.go`): isTailnetIP, routesCover,
+  matchNode, classifyUpError, resolveTailnet IP literals. `go test ./...`
+  passes.
+- README: all of the above + node-identity-in-backups semantics (J).
+- xcframework rebuilt with the new Go API; `flutter analyze` clean (pkg +
+  example); `flutter build ios --simulator` succeeds.
+- Example launch UI **verified in simulator** (screenshot: landing page +
+  URL bar render correctly). Sim `ts-browser-test`
+  (9540842C-9F8C-4482-B159-85E4B2BC967C, iPhone 16 Plus / iOS 26.5) exists,
+  shut down — reuse for real-key testing or `simctl delete` it.
 
 ### Remaining
-1. **First**: have the maintainer session review + commit the uncommitted
-   work — paste `HANDOFF.md` into a session in this repo. It also carries
-   the improvement backlog (status API, structured errors, peer cache,
-   shared transport, transactional start, Go tests, subnet-route routing).
-2. Boot example in a simulator, confirm launch UI (was interrupted — a
-   Tailarr e2e run owned the machine; the temp sim was deleted to save
-   disk. Recreate:
-   `xcrun simctl create ts-browser-test com.apple.CoreSimulator.SimDeviceType.iPhone-16-Plus com.apple.CoreSimulator.SimRuntime.iOS-26-5`).
-   App is prebuilt at `example/build/ios/iphonesimulator/Runner.app`.
-3. Real verification on device/sim with a fresh `tskey-auth-…` key: enable in
-   settings, browse to a `*.ts.net` host AND a public site (tests both proxy
-   paths). WKWebView proxying needs iOS 17+.
-4. Then: back to the original goal — fork apps (e.g. Immich) around this
-   package from a separate consumer session.
+1. Real end-to-end verification with a fresh `tskey-auth-…` key (needs the
+   user): enable in example settings, browse a `*.ts.net` host AND a public
+   site (both proxy paths), confirm status line shows self/peers, confirm
+   the key field empties (onKeyConsumed). Bonus: hit a subnet-routed LAN IP
+   (e.g. 192.168.64.x via the Mac's `apple-container` subnet router) to
+   exercise acceptRoutes.
+2. Then: back to the original goal — fork apps (e.g. Immich) around this
+   package from a consumer session.
 
 ### Gotchas
-- gvisor must match tailscale.com's go.mod pin or `gomobile bind` breaks.
+- gvisor must match tailscale.com's go.mod pin or `gomobile bind` breaks
+  ("found packages stack and bridge").
 - `WKWebsiteDataStore.proxyConfigurations` is iOS 17+; plugin returns
   UNSUPPORTED below that.
-- Only tailnet CIDR/peer-name destinations go via tsnet — subnet-routed LAN
-  IPs (e.g. 192.168.64.x via the Mac's subnet router) currently dial DIRECT,
-  not through the tailnet. Extend `isTailnetIP`/route handling if needed.
+- gomobile imports `StatusJSON() (string, error)` into Swift as
+  `statusJSON(_ error: NSErrorPointer) -> String` (nonnull return blocks
+  the throws transform) — not `throws`.
+- Two tsnet instances can't share the state dir — that's why re-start is
+  stop-then-start with rollback, not start-then-swap.
