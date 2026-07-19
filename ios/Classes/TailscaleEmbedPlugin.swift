@@ -1,5 +1,7 @@
 import Flutter
 import UIKit
+import WebKit
+import Network
 import TailscaleEmbed
 
 public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
@@ -25,6 +27,8 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
             handleEnsure(result: result)
         case "isRunning":
             result(tailscale?.isRunning() ?? false)
+        case "installWebViewProxy":
+            handleInstallWebViewProxy(call: call, result: result)
         case "getPort":
             if let port = proxyPort, tailscale?.isRunning() == true {
                 result(port)
@@ -117,6 +121,39 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
         tailscale?.stopProxy()
         tailscale = nil
         proxyPort = nil
+        result(nil)
+    }
+
+    // Points every WKWebView using the default WKWebsiteDataStore at the
+    // embedded node's local HTTP CONNECT proxy. The proxy carries ALL
+    // traffic (tailnet hosts via tsnet, everything else dialed directly),
+    // so no match/exclude domain lists are needed. Call again after the
+    // proxy rebinds on a new port — applies to subsequent loads.
+    private func handleInstallWebViewProxy(call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let args = call.arguments as? [String: Any],
+              let port = args["port"] as? Int,
+              port > 0, port <= 65535 else {
+            result(FlutterError(
+                code: "INVALID_ARGUMENT",
+                message: "Missing or invalid port argument",
+                details: nil
+            ))
+            return
+        }
+        guard #available(iOS 17.0, *) else {
+            result(FlutterError(
+                code: "UNSUPPORTED",
+                message: "WKWebView proxying requires iOS 17 (WKWebsiteDataStore.proxyConfigurations)",
+                details: nil
+            ))
+            return
+        }
+        let endpoint = NWEndpoint.hostPort(
+            host: NWEndpoint.Host("127.0.0.1"),
+            port: NWEndpoint.Port(rawValue: UInt16(port))!
+        )
+        WKWebsiteDataStore.default().proxyConfigurations =
+            [ProxyConfiguration(httpCONNECTProxy: endpoint)]
         result(nil)
     }
 

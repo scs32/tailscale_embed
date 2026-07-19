@@ -21,4 +21,11 @@ abstract class TailscaleBackend {
   Future<bool> isRunning();
 
   Future<int?> getPort();
+
+  /// Point the platform's system webview (WKWebView on iOS) at the local
+  /// proxy on [port], so webview traffic reaches the tailnet too. The proxy
+  /// carries all traffic (tailnet via tsnet, everything else dialed
+  /// directly). No-op by default; backends without webview support may
+  /// leave it unimplemented. On iOS this requires iOS 17+.
+  Future<void> installWebViewProxy(int port) async {}
 }

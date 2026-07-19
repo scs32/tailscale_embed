@@ -45,4 +45,9 @@ class MethodChannelTailscaleBackend implements TailscaleBackend {
   Future<int?> getPort() async {
     return _channel.invokeMethod<int>('getPort');
   }
+
+  @override
+  Future<void> installWebViewProxy(int port) async {
+    await _channel.invokeMethod('installWebViewProxy', {'port': port});
+  }
 }

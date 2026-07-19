@@ -18,6 +18,7 @@ class TailscaleEmbed {
       const TailscaleConfig(enabled: false, authKey: '');
 
   int? _proxyPort;
+  bool _webViewProxy = false;
 
   /// The local proxy port, or null when the node is not running.
   int? get proxyPort => _proxyPort;
@@ -28,11 +29,16 @@ class TailscaleEmbed {
   bool get isSupported => _backend.isSupported;
   bool get isEnabled => isSupported && config.enabled;
 
+  /// [webViewProxy]: also point the platform's system webview (WKWebView)
+  /// at the local proxy whenever the node (re)starts or rebinds, so webview
+  /// traffic reaches the tailnet too. Requires iOS 17+.
   void configure({
     required TailscaleConfigProvider config,
     TailscaleBackend? backend,
+    bool webViewProxy = false,
   }) {
     _config = config;
+    _webViewProxy = webViewProxy;
     if (backend != null) _backend = backend;
   }
 
@@ -41,7 +47,7 @@ class TailscaleEmbed {
   Future<int> start() async {
     final cfg = config;
     final port = await _backend.start(cfg.authKey, cfg.hostname);
-    _proxyPort = port;
+    await _adoptPort(port);
     return port;
   }
 
@@ -50,10 +56,15 @@ class TailscaleEmbed {
   Future<int> ensure() async {
     final port = await _backend.ensure();
     if (port != null) {
-      _proxyPort = port;
+      await _adoptPort(port);
       return port;
     }
     return start();
+  }
+
+  Future<void> _adoptPort(int port) async {
+    _proxyPort = port;
+    if (_webViewProxy) await _backend.installWebViewProxy(port);
   }
 
   Future<void> stop() async {
