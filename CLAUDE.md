@@ -1,5 +1,53 @@
 # tailscale_embed — session notes
 
+## Multi-identity session (2026-07-19, later): identities landed
+
+Tailarr's feature request implemented and committed: multiple node
+identities, one per app profile.
+
+- `TailscaleConfig.identity` (default `'default'`): logical label
+  (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`), validated in Swift; the plugin owns
+  the layout `AppSupport/tailscale/identities/<name>/`.
+- **Legacy migration** (chosen over mapping default→legacy path): the old
+  single state dir at `AppSupport/tailscale/` is moved in place to
+  `identities/default` — two atomic renames via a `tailscale.migrating`
+  marker (crash between them is recovered on the next call). Triggered from
+  stateDirectory/list/delete. Rationale: uniform layout keeps list/delete
+  trivial, no permanent special case.
+- **Switch**: `ensure()` compares `backend.activeIdentity()` (new channel
+  method `getActiveIdentity`) with the provider's identity; mismatch →
+  `start()` (native start already stops the running node first).
+  `TailscaleEmbed` now serializes start/ensure/stop/deleteIdentity through
+  a `_serialized()` future chain — an ensure arriving mid-switch waits,
+  then health-checks whichever identity won.
+- **Rollback**: failed start on B restarts A (lastGoodConfig carries the
+  identity; its state dir is recomputed). Error `details` =
+  `{rolledBack, activeIdentity}` (NSNull when nothing running).
+- **onKeyConsumed** is now `void Function(String identity)` (BREAKING);
+  fires with the identity from the config the start actually used.
+- `status().identity` (Go `SetIdentity` + StatusJSON, present even when
+  not running), `activeIdentity()`, `listIdentities()`,
+  `deleteIdentity(name)` (IDENTITY_ACTIVE when running; new code in
+  TailscaleErrorCodes + friendlyError).
+- Example: per-identity authKey/hostname prefs (default keeps legacy pref
+  keys), identity field + enrolled-identities list (tap = select, trash =
+  delete), Apply uses `ensure()` when switching identities.
+- xcframework rebuilt; `go test` green, `flutter analyze` clean (both),
+  sim-verified WITHOUT real keys: legacy migration (seeded fake
+  `tailscaled.state` moved to `identities/default`), listIdentities,
+  per-identity settings, deleteIdentity. Sim app uninstalled again,
+  `ts-browser-test` shut down.
+- NOT yet verified (needs real `tskey-auth-…`, same as existing pending
+  item): enrolling two identities, live switch with `status().identity`,
+  rollback-on-bad-key, onKeyConsumed attribution.
+
+### Coordination
+- **Tailarr** consumes multi-identity in its next plugin bump alongside
+  onKeyConsumed adoption (per-profile TAILSCALE_* fields, passes
+  `identity: <profileSlug>`, calls `ensure()` on profile switch; maps its
+  old global settings to the `default` profile — which is why default maps
+  to the legacy state).
+
 ## Maintainer session (2026-07-19): backlog worked, all committed
 
 The browser-example integration work AND the resulting improvement backlog

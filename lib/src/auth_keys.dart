@@ -23,6 +23,9 @@ class TailscaleErrorCodes {
 
   /// The operation requires a running node.
   static const notRunning = 'NOT_RUNNING';
+
+  /// The identity cannot be deleted because its node is currently running.
+  static const identityActive = 'IDENTITY_ACTIVE';
 }
 
 /// Auth-key validation and human-readable error mapping for tsnet failures.
@@ -70,6 +73,10 @@ class TailscaleAuthKeys {
         raw.contains('deadline')) {
       return 'Timed out reaching Tailscale — check your connection and '
           'toggle again.';
+    }
+    if (code == TailscaleErrorCodes.identityActive) {
+      return 'That identity is currently connected — switch to another '
+          'identity or turn Tailscale off before deleting it.';
     }
     if (code == TailscaleErrorCodes.notRunning) {
       return 'The embedded Tailscale node is not running. Toggle it on '

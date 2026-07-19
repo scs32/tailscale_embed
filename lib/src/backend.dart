@@ -31,6 +31,20 @@ abstract class TailscaleBackend {
   /// support; a `TailscaleStatus(running: false)` when the node is stopped.
   Future<TailscaleStatus?> status() async => null;
 
+  /// The identity name of the currently running node, or null when the node
+  /// is stopped (or the backend doesn't track identities).
+  Future<String?> activeIdentity() async => null;
+
+  /// Logical identity names that have on-disk state. Empty when the backend
+  /// doesn't support identities.
+  Future<List<String>> listIdentities() async => const [];
+
+  /// Delete the on-disk node state for [identity]. Throws with code
+  /// `IDENTITY_ACTIVE` when it names the currently running identity; a
+  /// no-op when the identity has no state (or the backend doesn't support
+  /// identities).
+  Future<void> deleteIdentity(String identity) async {}
+
   /// Point the platform's system webview (WKWebView on iOS) at the local
   /// proxy on [port], so webview traffic reaches the tailnet too. The proxy
   /// carries all traffic (tailnet via tsnet, everything else dialed

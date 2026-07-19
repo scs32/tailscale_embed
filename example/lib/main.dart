@@ -15,13 +15,17 @@ Future<void> main() async {
       enabled: Settings.instance.enabled,
       authKey: Settings.instance.authKey,
       hostname: Settings.instance.hostname,
+      // Each app "profile" maps to its own node identity (own state,
+      // own auth key, possibly a different tailnet).
+      identity: Settings.instance.identity,
     ),
     // Route WKWebView traffic through the embedded node's local proxy
     // (re-applied automatically whenever the node starts or rebinds).
     webViewProxy: true,
     // The node identity persists after first registration, so the plaintext
-    // auth key is no longer needed — delete it from storage.
-    onKeyConsumed: () => Settings.instance.authKey = '',
+    // auth key is no longer needed — delete it from storage. The callback
+    // says which identity consumed its key.
+    onKeyConsumed: (identity) => Settings.instance.clearAuthKey(identity),
   );
 
   runApp(const BrowserApp());

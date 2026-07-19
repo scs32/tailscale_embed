@@ -25,6 +25,7 @@ class MethodChannelTailscaleBackend implements TailscaleBackend {
       'ephemeral': config.ephemeral,
       'upTimeoutSeconds': config.upTimeout.inSeconds,
       'acceptRoutes': config.acceptRoutes,
+      'identity': config.identity,
     });
     if (port == null) {
       throw Exception('Failed to start the embedded Tailscale proxy');
@@ -59,6 +60,22 @@ class MethodChannelTailscaleBackend implements TailscaleBackend {
     if (raw == null) return null;
     return TailscaleStatus.fromJson(
         (jsonDecode(raw) as Map).cast<String, dynamic>());
+  }
+
+  @override
+  Future<String?> activeIdentity() {
+    return _channel.invokeMethod<String>('getActiveIdentity');
+  }
+
+  @override
+  Future<List<String>> listIdentities() async {
+    final names = await _channel.invokeMethod<List<Object?>>('listIdentities');
+    return names?.cast<String>() ?? const [];
+  }
+
+  @override
+  Future<void> deleteIdentity(String identity) async {
+    await _channel.invokeMethod('deleteIdentity', {'identity': identity});
   }
 
   @override

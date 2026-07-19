@@ -5,6 +5,9 @@ class TailscaleStatus {
   /// Whether the embedded node and its local proxy are running.
   final bool running;
 
+  /// The logical identity name this node's state belongs to, if known.
+  final String? identity;
+
   /// The local proxy port, or 0 when not running.
   final int proxyPort;
 
@@ -29,6 +32,7 @@ class TailscaleStatus {
 
   const TailscaleStatus({
     required this.running,
+    this.identity,
     this.proxyPort = 0,
     this.backendState = '',
     this.health = const [],
@@ -45,6 +49,7 @@ class TailscaleStatus {
   factory TailscaleStatus.fromJson(Map<String, dynamic> json) {
     return TailscaleStatus(
       running: json['running'] as bool? ?? false,
+      identity: json['identity'] as String?,
       proxyPort: json['proxyPort'] as int? ?? 0,
       backendState: json['backendState'] as String? ?? '',
       health: (json['health'] as List?)?.cast<String>() ?? const [],

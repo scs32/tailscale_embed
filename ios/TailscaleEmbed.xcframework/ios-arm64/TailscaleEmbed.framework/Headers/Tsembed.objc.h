@@ -53,6 +53,13 @@ Call before StartProxy.
  */
 - (void)setEphemeral:(BOOL)v;
 /**
+ * SetIdentity records the logical identity name this instance's state dir
+belongs to, so StatusJSON can report which identity is active. The name is
+purely informational here — the native layer owns the identity→path
+mapping. Call before StartProxy.
+ */
+- (void)setIdentity:(NSString* _Nullable)name;
+/**
  * SetUpTimeoutSeconds overrides how long StartProxy waits for the node to
 authenticate and come up (default 45s). Call before StartProxy.
  */
@@ -65,14 +72,16 @@ authenticate and come up (default 45s). Call before StartProxy.
  * StatusJSON returns a JSON summary of the node's state for consumer UIs:
 
 	{
-	  "running": bool, "proxyPort": int, "backendState": "Running",
+	  "running": bool, "identity": "default", "proxyPort": int,
+	  "backendState": "Running",
 	  "health": ["…"],
 	  "tailnet": {"name": "…", "magicDNSSuffix": "…"},
 	  "self": {"hostName": "…", "dnsName": "…", "ips": ["100.x.y.z"], "online": bool},
 	  "peers": [{"hostName": …, "dnsName": …, "ips": […], "online": bool, "routes": ["192.168.1.0/24"]}]
 	}
 
-When the node is not running it returns {"running": false}.
+When the node is not running it returns {"running": false} (plus the
+identity, when one was set).
  */
 - (NSString* _Nonnull)statusJSON:(NSError* _Nullable* _Nullable)error;
 /**

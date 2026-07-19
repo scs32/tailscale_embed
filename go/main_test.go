@@ -147,3 +147,18 @@ func TestResolveTailnetIPLiterals(t *testing.T) {
 		}
 	}
 }
+
+// StatusJSON must report the identity even when the node is not running, so
+// consumers can tell which identity a stopped instance belongs to.
+func TestStatusJSONIdentityNotRunning(t *testing.T) {
+	ts := &Tailscale{}
+	got, err := ts.StatusJSON()
+	if err != nil || got != `{"running":false}` {
+		t.Errorf("StatusJSON() = (%q, %v), want ({\"running\":false}, nil)", got, err)
+	}
+	ts.SetIdentity("work")
+	got, err = ts.StatusJSON()
+	if err != nil || got != `{"running":false,"identity":"work"}` {
+		t.Errorf("StatusJSON() = (%q, %v), want identity \"work\"", got, err)
+	}
+}

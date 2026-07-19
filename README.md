@@ -70,19 +70,54 @@ so a plaintext `tskey-auth-…` doesn't linger (the example app does this).
 `TailscaleConfig` also exposes `ephemeral`, `upTimeout` (default 45s), and
 `acceptRoutes`.
 
+### Multiple identities
+
+`TailscaleConfig.identity` (default `'default'`) names the **node identity**
+the config uses. Each identity keeps its own tailscaled state — its own
+node, auth key, and possibly a different tailnet — so app-level profiles can
+each be their own device on their own tailnet. The name is a logical label
+(`[A-Za-z0-9][A-Za-z0-9._-]*`, max 64 chars — slugify free-form profile
+names); the plugin owns the on-disk layout under
+`Application Support/tailscale/identities/<name>/`.
+
+- **Upgrades**: pre-identity installs kept a single node's state at
+  `Application Support/tailscale/`. It is migrated **in place** to
+  `identities/default` on first use (two atomic renames with crash
+  recovery), so an existing node keeps its enrollment — no re-enroll, no
+  new auth key.
+- **Switching**: config is read at `start()`/`ensure()`. When the provider
+  returns a different identity than the running node, the next `ensure()`
+  (or `start()`) stops the running node and starts the new identity's —
+  fresh enroll via that config's `authKey` if it has no state yet. Only one
+  node runs at a time; `start`/`ensure`/`stop` are serialized, so an
+  `ensure()` arriving mid-switch (e.g. `TailscaleGuard` on app resume)
+  waits and then health-checks whichever identity won.
+- **Rollback**: if a start on identity B fails (bad key, timeout), the
+  previously running identity A is restarted — tunnel-up beats
+  consistency. The error's `details` map carries `rolledBack` and
+  `activeIdentity` (the identity actually running, or null).
+- **Attribution**: `onKeyConsumed` receives the identity whose key was
+  consumed (from the config the start actually used, so it's correct even
+  if the provider switched mid-start). `status().identity` and
+  `TailscaleEmbed.activeIdentity()` report the running identity.
+- **Cleanup**: `listIdentities()` returns names with on-disk state;
+  `deleteIdentity(name)` removes one (e.g. when its profile is deleted).
+  Deleting the running identity fails with `IDENTITY_ACTIVE`.
+
 ### Status
 
 `TailscaleEmbed.instance.status()` returns a `TailscaleStatus` snapshot for
 settings pages and connection indicators: backend state, health warnings,
-tailnet name / MagicDNS suffix, self node (hostname, DNS name, IPs), and the
-peer list with per-peer online state and advertised routes.
+active identity, tailnet name / MagicDNS suffix, self node (hostname, DNS
+name, IPs), and the peer list with per-peer online state and advertised
+routes.
 
 ### Errors
 
 Failures carry **stable error codes** end-to-end (emitted in Go, parsed into
 `PlatformException.code`): `AUTH_TIMEOUT`, `AUTH_KEY_INVALID`,
-`AUTH_KEY_WRONG_TYPE`, `START_FAILED`, `PROXY_BIND_FAILED`, `NOT_RUNNING` —
-see `TailscaleErrorCodes`. Use `TailscaleAuthKeys.typeError()` to reject API
+`AUTH_KEY_WRONG_TYPE`, `START_FAILED`, `PROXY_BIND_FAILED`, `NOT_RUNNING`,
+`IDENTITY_ACTIVE` — see `TailscaleErrorCodes`. Use `TailscaleAuthKeys.typeError()` to reject API
 tokens / OAuth secrets before dialing, and
 `TailscaleAuthKeys.friendlyError()` to translate failures for humans (it
 prefers the codes, falling back to message text).
@@ -95,6 +130,7 @@ deliberate choice: restoring a backup restores the tailnet identity, so the
 app reconnects without a new auth key. If that doesn't fit your threat
 model, use `ephemeral: true` (no persisted identity, key required every
 start) or exclude the `tailscale/` state directory from backups in your app.
+With multiple identities, every enrolled identity's state is backed up.
 
 ## Example app
 

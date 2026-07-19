@@ -8,7 +8,13 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
     private var tailscale: TsembedTailscale?
     private var proxyPort: Int?
 
+    /// The identity name of the node currently running (or nil when
+    /// stopped). After a rollback this is the identity that actually came
+    /// back up, which may differ from the one the failed start asked for.
+    private var activeIdentity: String?
+
     private struct StartConfig {
+        let identity: String
         let authKey: String
         let hostname: String
         let ephemeral: Bool
@@ -18,8 +24,10 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
 
     /// The config of the last successful start — used to roll the node back
     /// when a re-start with new settings (e.g. a bad auth key) fails, so a
-    /// working node isn't torn down for nothing. The persisted identity
-    /// makes the rollback start succeed even with a consumed key.
+    /// working node isn't torn down for nothing. This includes the identity:
+    /// a failed switch to identity B restarts identity A's node (tunnel-up
+    /// beats consistency). The persisted identity makes the rollback start
+    /// succeed even with a consumed key.
     private var lastGoodConfig: StartConfig?
 
     public static func register(with registrar: FlutterPluginRegistrar) {
@@ -45,6 +53,12 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
             handleStatus(result: result)
         case "installWebViewProxy":
             handleInstallWebViewProxy(call: call, result: result)
+        case "getActiveIdentity":
+            result(tailscale?.isRunning() == true ? activeIdentity : nil)
+        case "listIdentities":
+            handleListIdentities(result: result)
+        case "deleteIdentity":
+            handleDeleteIdentity(call: call, result: result)
         case "getPort":
             if let port = proxyPort, tailscale?.isRunning() == true {
                 result(port)
@@ -72,6 +86,7 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
 
     private func makeInstance(stateDir: String, config: StartConfig) -> TsembedTailscale? {
         let instance = TsembedNewTailscale(stateDir, config.authKey, config.hostname)
+        instance?.setIdentity(config.identity)
         instance?.setEphemeral(config.ephemeral)
         instance?.setUpTimeoutSeconds(config.upTimeoutSeconds)
         instance?.setAcceptRoutes(config.acceptRoutes)
@@ -88,7 +103,18 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
             ))
             return
         }
+        let identity = args["identity"] as? String ?? "default"
+        guard Self.isValidIdentity(identity) else {
+            result(FlutterError(
+                code: "INVALID_ARGUMENT",
+                message: "Invalid identity name '\(identity)' — must match "
+                    + "[A-Za-z0-9][A-Za-z0-9._-]* (max 64 chars)",
+                details: nil
+            ))
+            return
+        }
         let config = StartConfig(
+            identity: identity,
             authKey: authKey,
             hostname: args["hostname"] as? String ?? "",
             ephemeral: args["ephemeral"] as? Bool ?? false,
@@ -96,7 +122,7 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
             acceptRoutes: args["acceptRoutes"] as? Bool ?? true
         )
 
-        guard let stateDir = stateDirectory() else {
+        guard let stateDir = stateDirectory(identity: identity) else {
             result(FlutterError(
                 code: "STATE_DIR_ERROR",
                 message: "Failed to create state directory",
@@ -123,22 +149,29 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
                 try instance?.startProxy(&port)
                 DispatchQueue.main.async {
                     self.proxyPort = port
+                    self.activeIdentity = config.identity
                     self.lastGoodConfig = config
                     result(port)
                 }
             } catch {
                 let flutterErr = self.flutterError(error, fallbackCode: "START_FAILED")
-                // Roll back: restart the previously-working node so a bad
-                // new key doesn't leave the user with no tunnel at all.
+                // Roll back: restart the previously-working node — its own
+                // identity's state dir, which may differ from the one that
+                // just failed — so a bad new key doesn't leave the user with
+                // no tunnel at all.
                 var rolledBack = false
+                var runningIdentity: String?
                 if let lastGood = self.lastGoodConfig,
-                   let fallback = self.makeInstance(stateDir: stateDir, config: lastGood) {
+                   let fallbackDir = self.stateDirectory(identity: lastGood.identity),
+                   let fallback = self.makeInstance(stateDir: fallbackDir, config: lastGood) {
                     var port: Int = 0
                     if (try? fallback.startProxy(&port)) != nil {
                         rolledBack = true
+                        runningIdentity = lastGood.identity
                         DispatchQueue.main.async {
                             self.tailscale = fallback
                             self.proxyPort = port
+                            self.activeIdentity = lastGood.identity
                         }
                     }
                 }
@@ -146,11 +179,15 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
                     if !rolledBack {
                         self.tailscale = nil
                         self.proxyPort = nil
+                        self.activeIdentity = nil
                     }
                     result(FlutterError(
                         code: flutterErr.code,
                         message: flutterErr.message,
-                        details: ["rolledBack": rolledBack]
+                        details: [
+                            "rolledBack": rolledBack,
+                            "activeIdentity": runningIdentity as Any? ?? NSNull(),
+                        ]
                     ))
                 }
             }
@@ -203,6 +240,68 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
         tailscale?.stopProxy()
         tailscale = nil
         proxyPort = nil
+        activeIdentity = nil
+        result(nil)
+    }
+
+    private func handleListIdentities(result: @escaping FlutterResult) {
+        migrateLegacyStateIfNeeded()
+        guard let dir = identitiesDirectory() else {
+            result([String]())
+            return
+        }
+        let fm = FileManager.default
+        let names = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? [])
+            .filter { name in
+                var isDir: ObjCBool = false
+                return Self.isValidIdentity(name)
+                    && fm.fileExists(
+                        atPath: dir.appendingPathComponent(name).path,
+                        isDirectory: &isDir)
+                    && isDir.boolValue
+            }
+        result(names.sorted())
+    }
+
+    private func handleDeleteIdentity(call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let args = call.arguments as? [String: Any],
+              let identity = args["identity"] as? String,
+              Self.isValidIdentity(identity) else {
+            result(FlutterError(
+                code: "INVALID_ARGUMENT",
+                message: "Missing or invalid identity argument",
+                details: nil
+            ))
+            return
+        }
+        if tailscale?.isRunning() == true, identity == activeIdentity {
+            result(FlutterError(
+                code: "IDENTITY_ACTIVE",
+                message: "Identity '\(identity)' is currently running — stop "
+                    + "the node or switch identities before deleting it",
+                details: nil
+            ))
+            return
+        }
+        migrateLegacyStateIfNeeded()
+        guard let dir = identitiesDirectory()?.appendingPathComponent(identity) else {
+            result(nil)
+            return
+        }
+        let fm = FileManager.default
+        if fm.fileExists(atPath: dir.path) {
+            do {
+                try fm.removeItem(at: dir)
+            } catch {
+                result(FlutterError(
+                    code: "DELETE_FAILED",
+                    message: "Could not delete identity '\(identity)': "
+                        + error.localizedDescription,
+                    details: nil
+                ))
+                return
+            }
+        }
         result(nil)
     }
 
@@ -239,20 +338,74 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
         result(nil)
     }
 
-    private func stateDirectory() -> String? {
-        guard let appSupportDir = FileManager.default.urls(
+    // MARK: - Identity state layout
+    //
+    // The plugin owns the on-disk layout under its state root; consumers only
+    // see logical identity names:
+    //
+    //   <AppSupport>/tailscale/identities/<name>/   one tsnet state dir each
+    //
+    // Versions before identities kept a single node's state directly at
+    // <AppSupport>/tailscale/. That state is migrated in place to
+    // identities/default on first use, so an upgrading user's node keeps its
+    // enrollment (uniform layout beats a permanent legacy special case, and
+    // makes list/delete trivial).
+
+    /// Identity names are logical labels, never paths: first char
+    /// alphanumeric (which also excludes "." and ".."), then a small safe
+    /// charset, bounded length.
+    static func isValidIdentity(_ name: String) -> Bool {
+        return name.range(
+            of: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+            options: .regularExpression
+        ) != nil
+    }
+
+    private func stateRoot() -> URL? {
+        FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
-        ).first else {
+        ).first?.appendingPathComponent("tailscale")
+    }
+
+    private func identitiesDirectory() -> URL? {
+        stateRoot()?.appendingPathComponent("identities")
+    }
+
+    /// Moves pre-identity state (a tsnet state dir directly at the root)
+    /// into identities/default. Two atomic renames with a crash-recovery
+    /// marker: root → tailscale.migrating, then tailscale.migrating →
+    /// identities/default. A crash between them leaves the .migrating dir,
+    /// which the next call finishes moving.
+    private func migrateLegacyStateIfNeeded() {
+        let fm = FileManager.default
+        guard let root = stateRoot(), let identities = identitiesDirectory() else { return }
+        let migrating = root.deletingLastPathComponent()
+            .appendingPathComponent("tailscale.migrating")
+
+        if !fm.fileExists(atPath: migrating.path) {
+            // Only a root holding actual node state needs migrating —
+            // tailscaled.state is the enrollment; logs alone are disposable.
+            let legacyState = root.appendingPathComponent("tailscaled.state")
+            guard fm.fileExists(atPath: legacyState.path),
+                  !fm.fileExists(atPath: identities.path) else { return }
+            try? fm.moveItem(at: root, to: migrating)
+        }
+        guard fm.fileExists(atPath: migrating.path) else { return }
+        try? fm.createDirectory(at: identities, withIntermediateDirectories: true)
+        try? fm.moveItem(at: migrating, to: identities.appendingPathComponent("default"))
+    }
+
+    private func stateDirectory(identity: String) -> String? {
+        migrateLegacyStateIfNeeded()
+        guard let dir = identitiesDirectory()?.appendingPathComponent(identity) else {
             return nil
         }
-
-        let stateDir = appSupportDir.appendingPathComponent("tailscale")
         try? FileManager.default.createDirectory(
-            at: stateDir,
+            at: dir,
             withIntermediateDirectories: true,
             attributes: nil
         )
-        return stateDir.path
+        return dir.path
     }
 }

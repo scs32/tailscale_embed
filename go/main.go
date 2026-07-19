@@ -71,6 +71,7 @@ type Tailscale struct {
 	mu        sync.Mutex
 	running   bool
 	stateDir  string
+	identity  string
 
 	upTimeout    time.Duration
 	acceptRoutes bool
@@ -110,6 +111,14 @@ func NewTailscale(stateDir, authKey, hostname string) *Tailscale {
 // Call before StartProxy.
 func (t *Tailscale) SetEphemeral(v bool) {
 	t.server.Ephemeral = v
+}
+
+// SetIdentity records the logical identity name this instance's state dir
+// belongs to, so StatusJSON can report which identity is active. The name is
+// purely informational here — the native layer owns the identity→path
+// mapping. Call before StartProxy.
+func (t *Tailscale) SetIdentity(name string) {
+	t.identity = name
 }
 
 // SetUpTimeoutSeconds overrides how long StartProxy waits for the node to
@@ -295,17 +304,26 @@ func (t *Tailscale) GetPort() int {
 // StatusJSON returns a JSON summary of the node's state for consumer UIs:
 //
 //	{
-//	  "running": bool, "proxyPort": int, "backendState": "Running",
+//	  "running": bool, "identity": "default", "proxyPort": int,
+//	  "backendState": "Running",
 //	  "health": ["…"],
 //	  "tailnet": {"name": "…", "magicDNSSuffix": "…"},
 //	  "self": {"hostName": "…", "dnsName": "…", "ips": ["100.x.y.z"], "online": bool},
 //	  "peers": [{"hostName": …, "dnsName": …, "ips": […], "online": bool, "routes": ["192.168.1.0/24"]}]
 //	}
 //
-// When the node is not running it returns {"running": false}.
+// When the node is not running it returns {"running": false} (plus the
+// identity, when one was set).
 func (t *Tailscale) StatusJSON() (string, error) {
 	if !t.IsRunning() {
-		return `{"running":false}`, nil
+		b, err := json.Marshal(struct {
+			Running  bool   `json:"running"`
+			Identity string `json:"identity,omitempty"`
+		}{false, t.identity})
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -323,6 +341,7 @@ func (t *Tailscale) StatusJSON() (string, error) {
 	}
 	out := struct {
 		Running      bool     `json:"running"`
+		Identity     string   `json:"identity,omitempty"`
 		ProxyPort    int      `json:"proxyPort"`
 		BackendState string   `json:"backendState"`
 		Health       []string `json:"health,omitempty"`
@@ -334,6 +353,7 @@ func (t *Tailscale) StatusJSON() (string, error) {
 		Peers []node `json:"peers"`
 	}{
 		Running:      true,
+		Identity:     t.identity,
 		ProxyPort:    t.GetPort(),
 		BackendState: st.BackendState,
 		Health:       st.Health,
