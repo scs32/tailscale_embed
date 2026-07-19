@@ -41,14 +41,82 @@ a fresh port if it died. Returns the current (possibly new) proxy port.
  */
 - (BOOL)isRunning;
 /**
+ * SetAcceptRoutes controls whether destinations inside peer-advertised
+subnet routes are dialed through the tailnet (default true — always
+correct; at worst a same-LAN destination hairpins through its subnet
+router). Call before StartProxy.
+ */
+- (void)setAcceptRoutes:(BOOL)v;
+/**
+ * SetEphemeral marks the node ephemeral (deregisters when it disconnects).
+Call before StartProxy.
+ */
+- (void)setEphemeral:(BOOL)v;
+/**
+ * SetUpTimeoutSeconds overrides how long StartProxy waits for the node to
+authenticate and come up (default 45s). Call before StartProxy.
+ */
+- (void)setUpTimeoutSeconds:(long)secs;
+/**
  * StartProxy starts the tsnet server and HTTP proxy, returning the proxy port.
  */
 - (BOOL)startProxy:(long* _Nullable)ret0_ error:(NSError* _Nullable* _Nullable)error;
+/**
+ * StatusJSON returns a JSON summary of the node's state for consumer UIs:
+
+	{
+	  "running": bool, "proxyPort": int, "backendState": "Running",
+	  "health": ["…"],
+	  "tailnet": {"name": "…", "magicDNSSuffix": "…"},
+	  "self": {"hostName": "…", "dnsName": "…", "ips": ["100.x.y.z"], "online": bool},
+	  "peers": [{"hostName": …, "dnsName": …, "ips": […], "online": bool, "routes": ["192.168.1.0/24"]}]
+	}
+
+When the node is not running it returns {"running": false}.
+ */
+- (NSString* _Nonnull)statusJSON:(NSError* _Nullable* _Nullable)error;
 /**
  * StopProxy stops the HTTP proxy and tsnet server.
  */
 - (void)stopProxy;
 @end
+
+/**
+ * Stable error codes carried in error strings as "tsembed:CODE: …" so they
+survive the gomobile→NSError→FlutterError trip intact. The native side
+parses the prefix into a structured error code; message text is for humans.
+ */
+FOUNDATION_EXPORT NSString* _Nonnull const TsembedErrCodeAuthKeyInvalid;
+/**
+ * Stable error codes carried in error strings as "tsembed:CODE: …" so they
+survive the gomobile→NSError→FlutterError trip intact. The native side
+parses the prefix into a structured error code; message text is for humans.
+ */
+FOUNDATION_EXPORT NSString* _Nonnull const TsembedErrCodeAuthKeyWrongType;
+/**
+ * Stable error codes carried in error strings as "tsembed:CODE: …" so they
+survive the gomobile→NSError→FlutterError trip intact. The native side
+parses the prefix into a structured error code; message text is for humans.
+ */
+FOUNDATION_EXPORT NSString* _Nonnull const TsembedErrCodeAuthTimeout;
+/**
+ * Stable error codes carried in error strings as "tsembed:CODE: …" so they
+survive the gomobile→NSError→FlutterError trip intact. The native side
+parses the prefix into a structured error code; message text is for humans.
+ */
+FOUNDATION_EXPORT NSString* _Nonnull const TsembedErrCodeNotRunning;
+/**
+ * Stable error codes carried in error strings as "tsembed:CODE: …" so they
+survive the gomobile→NSError→FlutterError trip intact. The native side
+parses the prefix into a structured error code; message text is for humans.
+ */
+FOUNDATION_EXPORT NSString* _Nonnull const TsembedErrCodeProxyBindFailed;
+/**
+ * Stable error codes carried in error strings as "tsembed:CODE: …" so they
+survive the gomobile→NSError→FlutterError trip intact. The native side
+parses the prefix into a structured error code; message text is for humans.
+ */
+FOUNDATION_EXPORT NSString* _Nonnull const TsembedErrCodeStartFailed;
 
 /**
  * NewTailscale creates a new Tailscale instance with the given state

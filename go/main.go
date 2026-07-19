@@ -2,6 +2,8 @@ package tsembed
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,18 +15,69 @@ import (
 	"sync"
 	"time"
 
+	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
 )
+
+// Stable error codes carried in error strings as "tsembed:CODE: …" so they
+// survive the gomobile→NSError→FlutterError trip intact. The native side
+// parses the prefix into a structured error code; message text is for humans.
+const (
+	ErrCodeAuthTimeout      = "AUTH_TIMEOUT"       // control plane unreachable / Up() deadline
+	ErrCodeAuthKeyInvalid   = "AUTH_KEY_INVALID"   // key invalid, expired, or already used
+	ErrCodeAuthKeyWrongType = "AUTH_KEY_WRONG_TYPE" // API token / OAuth secret, not a node auth key
+	ErrCodeStartFailed      = "START_FAILED"        // any other tsnet startup failure
+	ErrCodeProxyBindFailed  = "PROXY_BIND_FAILED"   // couldn't bind the local proxy listener
+	ErrCodeNotRunning       = "NOT_RUNNING"         // operation requires a running node
+)
+
+func codedErr(code string, err error) error {
+	return fmt.Errorf("tsembed:%s: %w", code, err)
+}
+
+// classifyUpError maps a tsnet Up() failure to a stable error code. The
+// classification happens here, at the source, where the full error chain is
+// still available (substring matching after gomobile flattening is fragile).
+func classifyUpError(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ErrCodeAuthTimeout
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "cannot be used for node auth"):
+		return ErrCodeAuthKeyWrongType
+	case strings.Contains(msg, "invalid key"):
+		return ErrCodeAuthKeyInvalid
+	case strings.Contains(msg, "deadline") || strings.Contains(msg, "timeout"):
+		return ErrCodeAuthTimeout
+	default:
+		return ErrCodeStartFailed
+	}
+}
+
+// statusCacheTTL bounds how stale routing decisions may be. resolveTailnet
+// runs on EVERY proxied dial (a browser fires dozens concurrently), so
+// Status() must not be an IPC round-trip each time.
+const statusCacheTTL = 3 * time.Second
 
 // Tailscale wraps tsnet.Server and provides an HTTP proxy for routing traffic.
 type Tailscale struct {
 	server    *tsnet.Server
 	proxy     *http.Server
+	httpClient *http.Client // shared transport for non-CONNECT requests
 	listener  net.Listener
 	proxyPort int
 	mu        sync.Mutex
 	running   bool
 	stateDir  string
+
+	upTimeout    time.Duration
+	acceptRoutes bool
+
+	stMu sync.Mutex
+	st   *ipnstate.Status
+	stAt time.Time
 }
 
 // NewTailscale creates a new Tailscale instance with the given state
@@ -38,7 +91,9 @@ func NewTailscale(stateDir, authKey, hostname string) *Tailscale {
 	os.Setenv("TS_LOGS_DIR", stateDir)
 
 	return &Tailscale{
-		stateDir: stateDir,
+		stateDir:     stateDir,
+		upTimeout:    45 * time.Second,
+		acceptRoutes: true,
 		server: &tsnet.Server{
 			Dir:       stateDir,
 			Hostname:  hostname,
@@ -49,6 +104,28 @@ func NewTailscale(stateDir, authKey, hostname string) *Tailscale {
 			},
 		},
 	}
+}
+
+// SetEphemeral marks the node ephemeral (deregisters when it disconnects).
+// Call before StartProxy.
+func (t *Tailscale) SetEphemeral(v bool) {
+	t.server.Ephemeral = v
+}
+
+// SetUpTimeoutSeconds overrides how long StartProxy waits for the node to
+// authenticate and come up (default 45s). Call before StartProxy.
+func (t *Tailscale) SetUpTimeoutSeconds(secs int) {
+	if secs > 0 {
+		t.upTimeout = time.Duration(secs) * time.Second
+	}
+}
+
+// SetAcceptRoutes controls whether destinations inside peer-advertised
+// subnet routes are dialed through the tailnet (default true — always
+// correct; at worst a same-LAN destination hairpins through its subnet
+// router). Call before StartProxy.
+func (t *Tailscale) SetAcceptRoutes(v bool) {
+	t.acceptRoutes = v
 }
 
 // StartProxy starts the tsnet server and HTTP proxy, returning the proxy port.
@@ -63,23 +140,53 @@ func (t *Tailscale) StartProxy() (int, error) {
 	// Start tsnet and block until the node is authenticated and running,
 	// so auth-key failures surface to the caller instead of silently
 	// leaving the node in NeedsLogin.
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), t.upTimeout)
 	defer cancel()
 	status, err := t.server.Up(ctx)
 	if err != nil {
 		t.server.Close()
-		return 0, fmt.Errorf("failed to start tsnet: %w", err)
+		return 0, codedErr(classifyUpError(err), fmt.Errorf("failed to start tsnet: %w", err))
 	}
 	log.Printf("[tsnet] up: %s (%v)", status.Self.HostName, status.TailscaleIPs)
+
+	// tsnet defaults RouteAll (accept-routes) to false; enable it so the
+	// embedded netstack routes peer-advertised subnets. This only affects
+	// the in-app node — no OS routing tables are touched.
+	if t.acceptRoutes {
+		if lc, err := t.server.LocalClient(); err == nil {
+			_, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+				Prefs:       ipn.Prefs{RouteAll: true},
+				RouteAllSet: true,
+			})
+			if err != nil {
+				log.Printf("[tsnet] enabling accept-routes failed: %v", err)
+			}
+		}
+	}
 
 	// Create listener on random port
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.server.Close()
-		return 0, fmt.Errorf("failed to create listener: %w", err)
+		return 0, codedErr(ErrCodeProxyBindFailed, fmt.Errorf("failed to create listener: %w", err))
 	}
 	t.listener = listener
 	t.proxyPort = listener.Addr().(*net.TCPAddr).Port
+
+	// One shared transport for all plain-HTTP proxying, so connections are
+	// reused across requests instead of building a Transport per request.
+	t.httpClient = &http.Client{
+		Transport: &http.Transport{
+			DialContext:         t.dial,
+			MaxIdleConns:        64,
+			MaxIdleConnsPerHost: 8,
+			IdleConnTimeout:     90 * time.Second,
+		},
+		// The proxy must relay redirects to the client, not follow them.
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 
 	// Create HTTP proxy server
 	t.proxy = &http.Server{
@@ -107,7 +214,7 @@ func (t *Tailscale) EnsureProxy() (int, error) {
 	defer t.mu.Unlock()
 
 	if !t.running {
-		return 0, fmt.Errorf("tailscale is not running")
+		return 0, codedErr(ErrCodeNotRunning, errors.New("tailscale is not running"))
 	}
 
 	// Health check: can we reach our own listener?
@@ -123,7 +230,7 @@ func (t *Tailscale) EnsureProxy() (int, error) {
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return 0, fmt.Errorf("failed to rebind listener: %w", err)
+		return 0, codedErr(ErrCodeProxyBindFailed, fmt.Errorf("failed to rebind listener: %w", err))
 	}
 	t.listener = listener
 	t.proxyPort = listener.Addr().(*net.TCPAddr).Port
@@ -151,6 +258,10 @@ func (t *Tailscale) StopProxy() {
 		t.proxy.Shutdown(ctx)
 	}
 
+	if t.httpClient != nil {
+		t.httpClient.CloseIdleConnections()
+	}
+
 	if t.listener != nil {
 		t.listener.Close()
 	}
@@ -158,6 +269,10 @@ func (t *Tailscale) StopProxy() {
 	if t.server != nil {
 		t.server.Close()
 	}
+
+	t.stMu.Lock()
+	t.st = nil
+	t.stMu.Unlock()
 
 	t.running = false
 	t.proxyPort = 0
@@ -177,6 +292,113 @@ func (t *Tailscale) GetPort() int {
 	return t.proxyPort
 }
 
+// StatusJSON returns a JSON summary of the node's state for consumer UIs:
+//
+//	{
+//	  "running": bool, "proxyPort": int, "backendState": "Running",
+//	  "health": ["…"],
+//	  "tailnet": {"name": "…", "magicDNSSuffix": "…"},
+//	  "self": {"hostName": "…", "dnsName": "…", "ips": ["100.x.y.z"], "online": bool},
+//	  "peers": [{"hostName": …, "dnsName": …, "ips": […], "online": bool, "routes": ["192.168.1.0/24"]}]
+//	}
+//
+// When the node is not running it returns {"running": false}.
+func (t *Tailscale) StatusJSON() (string, error) {
+	if !t.IsRunning() {
+		return `{"running":false}`, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st, err := t.status(ctx)
+	if err != nil {
+		return "", codedErr(ErrCodeNotRunning, fmt.Errorf("status unavailable: %w", err))
+	}
+
+	type node struct {
+		HostName string   `json:"hostName"`
+		DNSName  string   `json:"dnsName"`
+		IPs      []string `json:"ips"`
+		Online   bool     `json:"online"`
+		Routes   []string `json:"routes,omitempty"`
+	}
+	out := struct {
+		Running      bool     `json:"running"`
+		ProxyPort    int      `json:"proxyPort"`
+		BackendState string   `json:"backendState"`
+		Health       []string `json:"health,omitempty"`
+		Tailnet      *struct {
+			Name           string `json:"name"`
+			MagicDNSSuffix string `json:"magicDNSSuffix"`
+		} `json:"tailnet,omitempty"`
+		Self  *node  `json:"self,omitempty"`
+		Peers []node `json:"peers"`
+	}{
+		Running:      true,
+		ProxyPort:    t.GetPort(),
+		BackendState: st.BackendState,
+		Health:       st.Health,
+		Peers:        []node{},
+	}
+	if st.CurrentTailnet != nil {
+		out.Tailnet = &struct {
+			Name           string `json:"name"`
+			MagicDNSSuffix string `json:"magicDNSSuffix"`
+		}{st.CurrentTailnet.Name, st.CurrentTailnet.MagicDNSSuffix}
+	}
+	toNode := func(hostName, dnsName string, ips []netip.Addr, online bool, routes []netip.Prefix) node {
+		n := node{
+			HostName: hostName,
+			DNSName:  strings.TrimSuffix(dnsName, "."),
+			IPs:      []string{},
+			Online:   online,
+		}
+		for _, ip := range ips {
+			n.IPs = append(n.IPs, ip.String())
+		}
+		for _, r := range routes {
+			n.Routes = append(n.Routes, r.String())
+		}
+		return n
+	}
+	if st.Self != nil {
+		n := toNode(st.Self.HostName, st.Self.DNSName, st.Self.TailscaleIPs, st.Self.Online, nil)
+		out.Self = &n
+	}
+	for _, p := range st.Peer {
+		var routes []netip.Prefix
+		if p.PrimaryRoutes != nil {
+			routes = p.PrimaryRoutes.AsSlice()
+		}
+		out.Peers = append(out.Peers, toNode(p.HostName, p.DNSName, p.TailscaleIPs, p.Online, routes))
+	}
+
+	b, err := json.Marshal(out)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// status returns the node status, cached for statusCacheTTL — it backs every
+// proxied dial, so it must not hit the LocalClient each time.
+func (t *Tailscale) status(ctx context.Context) (*ipnstate.Status, error) {
+	t.stMu.Lock()
+	defer t.stMu.Unlock()
+	if t.st != nil && time.Since(t.stAt) < statusCacheTTL {
+		return t.st, nil
+	}
+	lc, err := t.server.LocalClient()
+	if err != nil {
+		return nil, err
+	}
+	st, err := lc.Status(ctx)
+	if err != nil {
+		return nil, err
+	}
+	t.st, t.stAt = st, time.Now()
+	return st, nil
+}
+
 // tailnetCGNAT / tailnetULA are the address ranges Tailscale assigns to
 // nodes; destinations inside them must be dialed through tsnet, anything
 // else is dialed directly (the proxy carries ALL traffic when a webview is
@@ -194,49 +416,85 @@ func isTailnetIP(host string) bool {
 	return tailnetCGNAT.Contains(addr) || tailnetULA.Contains(addr.Unmap())
 }
 
+// routesCover reports whether addr falls inside any advertised subnet route.
+// Default routes (exit nodes) are ignored — sending ALL traffic through an
+// exit node is a policy decision, not something to infer from a 0/0 route.
+func routesCover(addr netip.Addr, routes []netip.Prefix) bool {
+	addr = addr.Unmap()
+	for _, r := range routes {
+		if r.Bits() == 0 {
+			continue
+		}
+		if r.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchNode returns "ip:port" when host names this node — by full DNS name,
+// MagicDNS short name (first label), or bare hostname — or "" otherwise.
+func matchNode(host, port, dnsName, hostName string, ips []netip.Addr) string {
+	if len(ips) == 0 {
+		return ""
+	}
+	want := strings.TrimSuffix(strings.ToLower(host), ".")
+	dns := strings.TrimSuffix(strings.ToLower(dnsName), ".")
+	if dns == want || strings.HasPrefix(dns, want+".") || strings.EqualFold(hostName, host) {
+		return net.JoinHostPort(ips[0].String(), port)
+	}
+	return ""
+}
+
+// subnetRoutes returns all peer-advertised subnet routes from the cached
+// status (empty when accept-routes is disabled).
+func (t *Tailscale) subnetRoutes(ctx context.Context) []netip.Prefix {
+	if !t.acceptRoutes {
+		return nil
+	}
+	st, err := t.status(ctx)
+	if err != nil {
+		return nil
+	}
+	var routes []netip.Prefix
+	for _, p := range st.Peer {
+		if p.PrimaryRoutes != nil {
+			routes = append(routes, p.PrimaryRoutes.AsSlice()...)
+		}
+	}
+	return routes
+}
+
 // resolveTailnet turns a "host:port" into an "ip:port" that tsnet can dial
 // and reports whether the destination belongs to the tailnet.
 // The device has no system-wide MagicDNS (that's the whole point of the
 // in-app node), so *.ts.net FQDNs and MagicDNS short names won't resolve via
 // the OS. We resolve them ourselves from the node's own peer list. IP
-// literals and non-tailnet names pass through unchanged and are dialed
-// directly via the system dialer.
+// literals inside the tailnet ranges — or inside a peer-advertised subnet
+// route — dial via tsnet; everything else via the system dialer.
 func (t *Tailscale) resolveTailnet(ctx context.Context, hostport string) (string, bool) {
 	host, port, err := net.SplitHostPort(hostport)
 	if err != nil {
 		return hostport, false // no port; leave as-is
 	}
-	if net.ParseIP(host) != nil {
-		return hostport, isTailnetIP(host) // already an IP
-	}
-
-	lc, err := t.server.LocalClient()
-	if err != nil {
-		return hostport, false
-	}
-	st, err := lc.Status(ctx)
-	if err != nil {
-		return hostport, false
-	}
-
-	want := strings.TrimSuffix(strings.ToLower(host), ".")
-	match := func(dnsName, hostName string, ips []netip.Addr) string {
-		dns := strings.TrimSuffix(strings.ToLower(dnsName), ".")
-		// Full FQDN match, MagicDNS short-name match (first label), or
-		// bare hostname match.
-		if (dns == want || strings.HasPrefix(dns, want+".") ||
-			strings.EqualFold(hostName, host)) && len(ips) > 0 {
-			return net.JoinHostPort(ips[0].String(), port)
+	if addr, err := netip.ParseAddr(strings.Trim(host, "[]")); err == nil {
+		if isTailnetIP(addr.String()) {
+			return hostport, true
 		}
-		return ""
+		return hostport, routesCover(addr, t.subnetRoutes(ctx))
+	}
+
+	st, err := t.status(ctx)
+	if err != nil {
+		return hostport, false
 	}
 	if st.Self != nil {
-		if r := match(st.Self.DNSName, st.Self.HostName, st.Self.TailscaleIPs); r != "" {
+		if r := matchNode(host, port, st.Self.DNSName, st.Self.HostName, st.Self.TailscaleIPs); r != "" {
 			return r, true
 		}
 	}
 	for _, p := range st.Peer {
-		if r := match(p.DNSName, p.HostName, p.TailscaleIPs); r != "" {
+		if r := matchNode(host, port, p.DNSName, p.HostName, p.TailscaleIPs); r != "" {
 			log.Printf("[proxy] resolved %s -> %s", host, r)
 			return r, true
 		}
@@ -322,12 +580,7 @@ func (t *Tailscale) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Dial through tsnet for tailnet hosts, directly otherwise. The original
 	// Host header is left intact so the destination still sees its own name.
-	httpClient := &http.Client{
-		Transport: &http.Transport{
-			DialContext: t.dial,
-		},
-	}
-	resp, err := httpClient.Do(outReq)
+	resp, err := t.httpClient.Do(outReq)
 	if err != nil {
 		log.Printf("[proxy] HTTP %s %s failed: %v", outReq.Method, outReq.URL, err)
 		http.Error(w, fmt.Sprintf("request failed: %v", err), http.StatusBadGateway)
