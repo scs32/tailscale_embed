@@ -26,6 +26,12 @@ class TailscaleErrorCodes {
 
   /// The identity cannot be deleted because its node is currently running.
   static const identityActive = 'IDENTITY_ACTIVE';
+
+  /// The embedded node isn't available on this platform: no backend is
+  /// registered (e.g. a tvOS target where only the iOS plugin is present, or
+  /// any non-iOS platform). Check [TailscaleEmbed.isSupported] before enabling
+  /// to avoid this; if you catch it, treat Tailscale as simply off.
+  static const unsupported = 'UNSUPPORTED';
 }
 
 /// Auth-key validation and human-readable error mapping for tsnet failures.
@@ -81,6 +87,9 @@ class TailscaleAuthKeys {
     if (code == TailscaleErrorCodes.notRunning) {
       return 'The embedded Tailscale node is not running. Toggle it on '
           'to reconnect.';
+    }
+    if (code == TailscaleErrorCodes.unsupported) {
+      return 'The embedded Tailscale node is not available on this device.';
     }
     final detail =
         error is PlatformException ? (error.message ?? raw) : raw;

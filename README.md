@@ -16,8 +16,11 @@ has been running in production on iOS since July 2026.
 - A **MethodChannel plugin** (`ios/Classes/`) bridges start/ensure/stop.
 - A global **`HttpOverrides`** installs a `findProxy` that sends tailnet
   destinations to the local proxy — capturing every `dart:io HttpClient` in
-  the app (`package:http`, Dio, image loading, …) with **zero changes to
-  request code**.
+  the app (`package:http`'s default `IOClient`, Dio, `Image.network`, …)
+  with **zero changes to request code**. Apps that swap in a **native HTTP
+  client** (`cupertino_http`, `cronet_http`, `win_http`) don't ride
+  `dart:io`, so `HttpOverrides` can't see them — wrap those in
+  [`TailscaleClient`](#routing-native-http-clients) instead.
 - **`TailscaleGuard`** re-checks node + listener health on launch/foreground
   (iOS reclaims sockets during suspension) behind a blocking overlay.
 - MagicDNS names are resolved **on-device from the node's peer list** — the
@@ -53,7 +56,7 @@ dependencies:
   tailscale_embed:
     git:
       url: https://github.com/scs32/tailscale_embed.git
-      ref: v0.2.0
+      ref: v0.3.0
 ```
 
 Pin a version tag rather than `main` or a commit hash: tags communicate
@@ -133,6 +136,12 @@ SharedPreferences/profile object — the package never owns storage. Pass
 `showIdentity: false` when your app drives the identity from its own
 profile switcher. See `example/lib/settings.dart` for a complete store.
 
+Single-tailnet apps (no identity switching) can extend
+**`SingleIdentityTailscaleStore`** instead and implement just three plain
+pairs — `enabled`, `authKey`, `hostname` — over their storage; it collapses
+the per-identity API onto them and pins the identity to `default`. Pair it
+with `showIdentity: false`.
+
 ### Multiple identities
 
 `TailscaleConfig.identity` (default `'default'`) names the **node identity**
@@ -206,6 +215,94 @@ paths), `statusOverride` (peer lists, health), `enrolled` (pre-seeded
 identities), plus `startedConfigs` recording for assertions. This package's
 own `test/` uses it, including pumping `TailscaleSettingsPanel`.
 
+### Routing native HTTP clients
+
+Global `TailscaleHttpOverrides` only captures clients built on `dart:io`'s
+`HttpClient` — `IOClient`, and `package:http`/Dio **when they use it**. Many
+production apps deliberately pick a **native** client for HTTP/2, background
+sessions, or connection pooling: `cupertino_http` (`NSURLSession`),
+`cronet_http`, `win_http`. Those ride the platform stack, not `dart:io`, so
+`HttpOverrides` routes none of their traffic.
+
+`TailscaleClient` (in `tailscale_embed_http.dart`) is the drop-in for that
+case. It wraps any `http.Client`: tailnet hosts (including bare MagicDNS
+short names) go through the embedded proxy, and **everything else is
+forwarded to your client unchanged**, so public traffic keeps the native
+stack you chose.
+
+```dart
+import 'package:tailscale_embed/tailscale_embed_http.dart';
+
+// Keep CupertinoClient for the public internet; tailnet Just Works.
+final http.Client client = TailscaleClient(
+  CupertinoClient.defaultSessionConfiguration(),
+);
+await client.get(Uri.parse('http://truenas-ts/'));   // → embedded proxy
+await client.get(Uri.parse('https://example.com/')); // → CupertinoClient
+```
+
+The tailnet path uses a small `dart:io` client internally and reads the
+proxy port **live per request**, so an iOS socket rebind needs no
+reconfiguration. That internal client is HTTP/1.1 with keep-alive and a
+bounded per-host connection pool (default 6), so a burst of small requests to
+one tailnet host — a poster/artwork grid — reuses connections instead of
+opening one per request. Grid-heavy apps can raise the cap:
+`TailscaleClient.custom(inner: ..., maxConnectionsPerHost: 12)`.
+`TailscaleClient.routesThroughTailnet(uri)` exposes the routing decision;
+`custom(...)` also controls `closeInner` and can configure the tunnel
+`HttpClient` (TLS callbacks, …). Large media never rides this path — send
+streams/downloads to a native player/downloader (see below).
+
+### Routing native media players and downloaders
+
+A media player (libmpv, `AVPlayer`, `ExoPlayer`) **or a native downloader**
+(`background_downloader` and friends — background `URLSession`/`WorkManager`
+tasks) opens sockets in native code, below Dart entirely — neither
+`HttpOverrides` nor `TailscaleClient` touches it. If it pulls from a
+tailnet-only server (streaming *or* offline download of episodes/movies) it
+won't reach the host until you point it at the local proxy directly. All
+three sinks — player, downloader, and any native `URLSession` config — feed
+off the same `proxyPortListenable`.
+
+For **libmpv** (via `media_kit`/`dart_vlc`-style bindings), set the
+`http-proxy` property:
+
+```dart
+void applyProxy() {
+  final port = TailscaleEmbed.instance.proxyPort;
+  player.setProperty('http-proxy', port != null ? 'http://127.0.0.1:$port' : '');
+}
+```
+
+Two things make this robust:
+
+- **Rebind**: the port can change on an iOS socket rebind, and a player that
+  baked it in at `open()` won't know. Subscribe to `proxyPortListenable` and
+  re-apply — this is the one primitive native/long-lived sinks need:
+  ```dart
+  TailscaleEmbed.instance.proxyPortListenable.addListener(applyProxy);
+  ```
+- **MagicDNS**: the proxy resolves hostnames on the tailnet side, so a
+  player's ffmpeg layer doesn't need MagicDNS locally — `http://truenas-ts/`
+  and `*.ts.net` URLs resolve through the proxy. (For `AVPlayer`/`ExoPlayer`,
+  set the platform proxy on the data source / `HttpDataSource` the same way,
+  and re-apply on the listenable.)
+- **Downloaders**: a background downloader takes its own proxy config — on
+  iOS via the task's `URLSessionConfiguration.connectionProxyDictionary`, on
+  Android via the `WorkManager`/OkHttp layer. Set it from the live port, and
+  re-apply from `proxyPortListenable` for tasks queued before a rebind, so an
+  offline download from a tailnet-only server actually completes.
+
+### Client lifetime and enabling mid-session
+
+`findProxy` and `TailscaleClient` read the live proxy port on every request,
+so a `dart:io`/`http` client **built before Tailscale was enabled routes
+correctly the moment the node comes up** — no rebuild needed. The exception
+is anything that captures the port (or a routing decision) **at construction
+time**: native player instances, native `URLSession`/OkHttp proxy configs.
+For those, either build them lazily (after `ensure()`), or reconfigure them
+from `proxyPortListenable`. Prefer the listenable — it also covers rebinds.
+
 ## Example app
 
 `example/` is a minimal **browser**: a WKWebView (`webview_flutter`) whose
@@ -219,8 +316,25 @@ cd example && flutter run
 
 ## Platforms
 
-iOS only for now. `TailscaleBackend` is the extension seam for an Android
-backend (gomobile `.aar`, or an FFI package) without touching consumers.
+**iOS only** for now. On every other platform `TailscaleEmbed.isSupported`
+is `false`, so the whole API is a safe no-op — `TailscaleGuard` skips,
+`findProxy`/`TailscaleClient` route everything direct. A **tvOS** target
+(which Flutter reports as `TargetPlatform.iOS`, but where the native plugin
+isn't registered) is detected on the first channel call and latches to
+unsupported; an explicit `start()` there fails with the stable `UNSUPPORTED`
+code rather than a raw `MissingPluginException`.
+
+`TailscaleBackend` is the extension seam for other platforms. **Android and
+macOS backends are the top roadmap item** — for a media client the center of
+gravity is Android/Android TV, so iOS-only is a hard ceiling on "drop into
+any project." Android needs a gomobile `.aar` + a Kotlin plugin with
+method-channel parity and its own proxy lifecycle; macOS its own build. Both
+slot in behind `TailscaleBackend` without touching consumers, but each is a
+dedicated effort (and multiplies the framework-distribution/CI story), so
+they're tracked separately rather than bundled into a point release. Scope
+note for the Android effort: it's **"Android + TV input"**, not just phones —
+pasting a `tskey-auth-…` on a leanback remote is brutal, so auth-key entry
+will want a QR/pairing path (which also improves the tvOS story).
 
 ## The prebuilt framework
 

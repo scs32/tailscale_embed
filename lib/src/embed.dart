@@ -1,3 +1,5 @@
+import 'package:flutter/foundation.dart';
+
 import 'backend.dart';
 import 'config.dart';
 import 'method_channel_backend.dart';
@@ -18,7 +20,7 @@ class TailscaleEmbed {
   TailscaleConfigProvider _config = () =>
       const TailscaleConfig(enabled: false, authKey: '');
 
-  int? _proxyPort;
+  final ValueNotifier<int?> _proxyPort = ValueNotifier<int?>(null);
   bool _webViewProxy = false;
   void Function(String identity)? _onKeyConsumed;
 
@@ -47,7 +49,23 @@ class TailscaleEmbed {
   }
 
   /// The local proxy port, or null when the node is not running.
-  int? get proxyPort => _proxyPort;
+  int? get proxyPort => _proxyPort.value;
+
+  /// The local proxy port as a listenable, firing whenever it changes: on
+  /// start, on an iOS socket rebind (the port can move), and back to null on
+  /// stop. `findProxy`/[tailscaleFindProxy] read [proxyPort] live per-request
+  /// so `dart:io` clients never need this — but anything that *bakes the port
+  /// in* at construction (a native `URLSession`/OkHttp proxy config, a loaded
+  /// libmpv `http-proxy`, an `ExoPlayer`/`AVPlayer` data source) is otherwise
+  /// blind to a rebind. Subscribe here to reconfigure those long-lived sinks:
+  ///
+  /// ```dart
+  /// TailscaleEmbed.instance.proxyPortListenable.addListener(() {
+  ///   final port = TailscaleEmbed.instance.proxyPort;
+  ///   if (port != null) player.setProperty('http-proxy', 'http://127.0.0.1:$port');
+  /// });
+  /// ```
+  ValueListenable<int?> get proxyPortListenable => _proxyPort;
 
   TailscaleBackend get backend => _backend;
   TailscaleConfig get config => _config();
@@ -132,13 +150,13 @@ class TailscaleEmbed {
       });
 
   Future<void> _adoptPort(int port) async {
-    _proxyPort = port;
+    _proxyPort.value = port;
     if (_webViewProxy) await _backend.installWebViewProxy(port);
   }
 
   Future<void> stop() => _serialized(() async {
         await _backend.stop();
-        _proxyPort = null;
+        _proxyPort.value = null;
       });
 
   Future<bool> isRunning() => _backend.isRunning();
