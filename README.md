@@ -243,16 +243,29 @@ await client.get(Uri.parse('https://example.com/')); // → CupertinoClient
 
 The tailnet path uses a small `dart:io` client internally and reads the
 proxy port **live per request**, so an iOS socket rebind needs no
-reconfiguration. `TailscaleClient.routesThroughTailnet(uri)` exposes the
-routing decision; `TailscaleClient.custom(...)` controls `closeInner` and
-lets you configure the internal tunnel `HttpClient` (TLS callbacks, …).
+reconfiguration. That internal client is HTTP/1.1 with keep-alive and a
+bounded per-host connection pool (default 6), so a burst of small requests to
+one tailnet host — a poster/artwork grid — reuses connections instead of
+opening one per request. Grid-heavy apps can raise the cap:
+`TailscaleClient.custom(inner: ..., maxConnectionsPerHost: 12)`.
+`TailscaleClient.routesThroughTailnet(uri)` exposes the routing decision;
+`custom(...)` also controls `closeInner` and can configure the tunnel
+`HttpClient` (TLS callbacks, …). Large media never rides this path — send
+streams/downloads to a native player/downloader (see below).
 
-### Routing native media players
+### Routing native media players and downloaders
 
-A media player (libmpv, `AVPlayer`, `ExoPlayer`) opens sockets in native
-code, below Dart entirely — neither `HttpOverrides` nor `TailscaleClient`
-touches it. Point it at the local proxy directly. For **libmpv** (via
-`media_kit`/`dart_vlc`-style bindings), set the `http-proxy` property:
+A media player (libmpv, `AVPlayer`, `ExoPlayer`) **or a native downloader**
+(`background_downloader` and friends — background `URLSession`/`WorkManager`
+tasks) opens sockets in native code, below Dart entirely — neither
+`HttpOverrides` nor `TailscaleClient` touches it. If it pulls from a
+tailnet-only server (streaming *or* offline download of episodes/movies) it
+won't reach the host until you point it at the local proxy directly. All
+three sinks — player, downloader, and any native `URLSession` config — feed
+off the same `proxyPortListenable`.
+
+For **libmpv** (via `media_kit`/`dart_vlc`-style bindings), set the
+`http-proxy` property:
 
 ```dart
 void applyProxy() {
@@ -274,6 +287,11 @@ Two things make this robust:
   and `*.ts.net` URLs resolve through the proxy. (For `AVPlayer`/`ExoPlayer`,
   set the platform proxy on the data source / `HttpDataSource` the same way,
   and re-apply on the listenable.)
+- **Downloaders**: a background downloader takes its own proxy config — on
+  iOS via the task's `URLSessionConfiguration.connectionProxyDictionary`, on
+  Android via the `WorkManager`/OkHttp layer. Set it from the live port, and
+  re-apply from `proxyPortListenable` for tasks queued before a rebind, so an
+  offline download from a tailnet-only server actually completes.
 
 ### Client lifetime and enabling mid-session
 
@@ -307,12 +325,16 @@ unsupported; an explicit `start()` there fails with the stable `UNSUPPORTED`
 code rather than a raw `MissingPluginException`.
 
 `TailscaleBackend` is the extension seam for other platforms. **Android and
-macOS backends are the top roadmap item** — for cross-platform apps that's
-what unlocks broad reach. Android needs a gomobile `.aar` + a Kotlin plugin
-with method-channel parity and its own proxy lifecycle; macOS its own build.
-Both slot in behind `TailscaleBackend` without touching consumers, but each
-is a dedicated effort (and multiplies the framework-distribution/CI story),
-so they're tracked separately rather than bundled into a point release.
+macOS backends are the top roadmap item** — for a media client the center of
+gravity is Android/Android TV, so iOS-only is a hard ceiling on "drop into
+any project." Android needs a gomobile `.aar` + a Kotlin plugin with
+method-channel parity and its own proxy lifecycle; macOS its own build. Both
+slot in behind `TailscaleBackend` without touching consumers, but each is a
+dedicated effort (and multiplies the framework-distribution/CI story), so
+they're tracked separately rather than bundled into a point release. Scope
+note for the Android effort: it's **"Android + TV input"**, not just phones —
+pasting a `tskey-auth-…` on a leanback remote is brutal, so auth-key entry
+will want a QR/pairing path (which also improves the tvOS story).
 
 ## The prebuilt framework
 

@@ -2,18 +2,44 @@
 
 ## Plezy feedback session (2026-07-20, latest): drop-in DX gaps, v0.3.0
 
-**State correction (verified at break time, same day):** commit `2c109c0`
-IS on origin/main — committed and pushed, contrary to the "NOT yet pushed"
-note below. What's actually still missing: the **`v0.3.0` git tag** (only
-v0.2.0 exists) and the README install snippet still says `ref: v0.2.0` —
-bump it when tagging. Then the Plezy relay (item 1 below).
+**State (git-verified):** origin/main is at `11b087e` (v0.2.0). The v0.3.0
+work is commit `2c109c0` on branch `feat/plezy-dx-v0.3.0`, pushed as **PR #1
+(open, UNMERGED)** — an earlier break-time note wrongly said it was on main;
+it is not. Plezy round-2 riders were then added on the same branch (see
+"Riders" below). Still missing before release: **merge PR #1**, then the
+**`v0.3.0` git tag** (only v0.2.0 exists) and the README install snippet
+`ref: v0.2.0 → v0.3.0`. Then the Plezy relay (item 1 below).
+
+### Riders from Plezy verification round 2 (2026-07-20, same day)
+Plezy traced all three decisions against real data paths — all three land
+right, no design change. Two follow-ups landed on the branch:
+- **Rider 1 (code):** `TailscaleClient`'s internal tunnel now sets
+  `maxConnectionsPerHost` (default `6`, `TailscaleClient.defaultMaxConnectionsPerHost`)
+  and `.custom(maxConnectionsPerHost:)` exposes it. dart:io's default is
+  unbounded → a poster/artwork grid over one tailnet host opened a connection
+  per request; now HTTP/1.1 keep-alive with a bounded pool. Grid-heavy apps
+  raise to ~12. Test added (24/24). Confirmed: large media never rides the
+  Dart http path in Plezy (playback→libmpv http-proxy, offline→
+  background_downloader, only API/artwork→Dart client), so the delegating
+  wrapper's loss of native HTTP/2 only touches small requests — acceptable.
+- **Rider 2 (docs):** native **downloaders** (background_downloader:
+  URLSession/WorkManager) are a THIRD native egress sink, not modeled before —
+  an offline download from a tailnet-only server fails unless routed. Media
+  doc section is now "…players and downloaders"; `proxyPortListenable` feeds
+  all three sinks (strongest vote that Gap 2 is the keystone). Roadmap note:
+  scope the Android effort as **"Android + TV input"** (QR/pairing auth, not
+  pasting tskey on a leanback remote — media center of gravity is Android TV).
+- Gap 7 confirmed skip (Plezy has its own SettingsService; a package-shipped
+  shared_prefs store would be a second island serious apps route around).
+  They'll adopt `SingleIdentityTailscaleStore`.
 
 Plezy (edde746/plezy, ~2900★ cross-platform Plex/Jellyfin client) integrated
 v0.2.0 and filed 7 gaps. Gatekeeper triage (kept surface crisp): built the
 pure-Dart / DX ones, deferred the big platform work. **No xcframework
 rebuild** — all changes are Dart + docs. `flutter analyze` clean (pkg +
-example), `flutter test` 23/23 green. Version bumped 0.2.0 → **0.3.0**
-(additive API, non-breaking) in pubspec + podspec. NOT committed/pushed yet.
+example), `flutter test` **24/24** green (23 + rider-1 pooling test). Version
+bumped 0.2.0 → **0.3.0** (additive API, non-breaking) in pubspec + podspec.
+Committed on branch `feat/plezy-dx-v0.3.0` (PR #1, unmerged) — see State above.
 
 ### What landed
 - **Gap 2 — proxy-port listenable (highest ROI):** `TailscaleEmbed.instance

@@ -60,6 +60,25 @@ void main() {
       expect(seen, isEmpty);
     });
 
+    test('tunnel client is bounded per host and stays configurable', () async {
+      int? seenCap;
+      final client = TailscaleClient.custom(
+        inner: MockClient((_) async => http.Response('', 200)),
+        maxConnectionsPerHost: 9,
+        configureTunnelClient: (c) => seenCap = c.maxConnectionsPerHost,
+      );
+
+      // A tailnet request builds the tunnel (the connect then fails DNS).
+      await expectLater(
+        client.get(Uri.parse('http://x.tail9999.ts.net/')),
+        throwsA(anything),
+      );
+
+      // The cap was applied before the hook ran, and the hook saw/could
+      // override it.
+      expect(seenCap, 9);
+    });
+
     test('close does not close a borrowed inner client', () {
       var closed = false;
       final inner = _ClosableMock(() => closed = true);

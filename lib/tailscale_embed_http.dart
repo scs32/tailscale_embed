@@ -57,9 +57,24 @@ class TailscaleClient extends http.BaseClient {
   /// is shared and owned elsewhere.
   final bool closeInner;
 
+  /// Bound on concurrent connections the internal tunnel [HttpClient] opens to
+  /// a single host, applied before [configureTunnelClient]. The tunnel is
+  /// HTTP/1.1 with keep-alive, so requests past this cap queue and reuse
+  /// pooled connections instead of opening one per request — which matters for
+  /// bursts of many small requests to the same tailnet host (a poster/artwork
+  /// grid hitting one media server). Raise it for grid-heavy apps; `dart:io`'s
+  /// own default is unbounded, which is the footgun this replaces.
+  final int maxConnectionsPerHost;
+
+  /// A sane default per-host connection cap for the tunnel. Grid/thumbnail-
+  /// heavy apps (media libraries) may want to raise this via
+  /// [TailscaleClient.custom] — e.g. `maxConnectionsPerHost: 12`.
+  static const int defaultMaxConnectionsPerHost = 6;
+
   /// Applied to the internal `dart:io` [HttpClient] that carries tailnet
   /// requests — mirror any [inner]-side settings that must also hold on the
-  /// tailnet path (user agent header hooks, `badCertificateCallback`, …).
+  /// tailnet path (user agent header hooks, `badCertificateCallback`, …). Runs
+  /// after [maxConnectionsPerHost] is set, so it can override it too.
   final void Function(HttpClient client)? configureTunnelClient;
 
   IOClient? _tunnel;
@@ -69,13 +84,15 @@ class TailscaleClient extends http.BaseClient {
     http.Client? inner,
   ])  : inner = inner ?? http.Client(),
         closeInner = true,
+        maxConnectionsPerHost = defaultMaxConnectionsPerHost,
         configureTunnelClient = null;
 
-  /// Full-control constructor: choose whether [close] cascades to [inner] and
-  /// configure the internal tunnel [HttpClient].
+  /// Full-control constructor: choose whether [close] cascades to [inner], tune
+  /// the tunnel's [maxConnectionsPerHost], and configure its [HttpClient].
   TailscaleClient.custom({
     required this.inner,
     this.closeInner = true,
+    this.maxConnectionsPerHost = defaultMaxConnectionsPerHost,
     this.configureTunnelClient,
   });
 
@@ -96,7 +113,9 @@ class TailscaleClient extends http.BaseClient {
   }
 
   IOClient _buildTunnel() {
-    final httpClient = HttpClient()..findProxy = tailscaleFindProxy;
+    final httpClient = HttpClient()
+      ..findProxy = tailscaleFindProxy
+      ..maxConnectionsPerHost = maxConnectionsPerHost;
     configureTunnelClient?.call(httpClient);
     return IOClient(httpClient);
   }
