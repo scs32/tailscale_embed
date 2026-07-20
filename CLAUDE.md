@@ -1,6 +1,12 @@
 # tailscale_embed — session notes
 
-## Plezy feedback session (2026-07-20, latest): drop-in DX gaps, v0.3.0, NOT yet pushed
+## Plezy feedback session (2026-07-20, latest): drop-in DX gaps, v0.3.0
+
+**State correction (verified at break time, same day):** commit `2c109c0`
+IS on origin/main — committed and pushed, contrary to the "NOT yet pushed"
+note below. What's actually still missing: the **`v0.3.0` git tag** (only
+v0.2.0 exists) and the README install snippet still says `ref: v0.2.0` —
+bump it when tagging. Then the Plezy relay (item 1 below).
 
 Plezy (edde746/plezy, ~2900★ cross-platform Plex/Jellyfin client) integrated
 v0.2.0 and filed 7 gaps. Gatekeeper triage (kept surface crisp): built the
