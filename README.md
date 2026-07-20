@@ -194,14 +194,22 @@ cd example && flutter run
 iOS only for now. `TailscaleBackend` is the extension seam for an Android
 backend (gomobile `.aar`, or an FFI package) without touching consumers.
 
-## Rebuilding the framework
+## The prebuilt framework
 
-The xcframework is checked in so consumers don't need a Go toolchain.
-To rebuild (e.g. after bumping `tailscale.com`):
+The xcframework is **not** in git — it's published on GitHub Releases and
+fetched automatically at `pod install` time by `ios/download_framework.sh`,
+checksum-pinned by `ios/Framework.lock`. Consumers need no Go toolchain and
+no manual steps; the download is cached until the pin changes. Old release
+assets must never be deleted — every commit's pin must stay downloadable.
+
+To rebuild from source (offline fallback, or after bumping `tailscale.com`):
 
 ```sh
-go/build.sh
+go/build.sh            # build + install locally (marks ios/.framework-local)
+go/build.sh --publish  # also upload a new release + update Framework.lock
 ```
+
+After `--publish`, commit the updated `ios/Framework.lock`.
 
 **Gotcha:** gvisor must match tailscale's own go.mod pin — a newer gvisor
 breaks `gomobile bind` with "found packages stack and bridge" errors.

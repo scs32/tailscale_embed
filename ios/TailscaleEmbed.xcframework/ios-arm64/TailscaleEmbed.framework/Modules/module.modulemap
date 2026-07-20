@@ -1,8 +1,0 @@
-framework module "TailscaleEmbed" {
-	header "ref.h"
-    header "Tsembed.objc.h"
-    header "Universe.objc.h"
-    header "TailscaleEmbed.h"
-
-    export *
-}
