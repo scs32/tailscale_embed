@@ -2,13 +2,18 @@
 
 ## Plezy feedback session (2026-07-20, latest): drop-in DX gaps, v0.3.0
 
-**State (git-verified):** origin/main is at `11b087e` (v0.2.0). The v0.3.0
-work is commit `2c109c0` on branch `feat/plezy-dx-v0.3.0`, pushed as **PR #1
-(open, UNMERGED)** — an earlier break-time note wrongly said it was on main;
-it is not. Plezy round-2 riders were then added on the same branch (see
-"Riders" below). Still missing before release: **merge PR #1**, then the
-**`v0.3.0` git tag** (only v0.2.0 exists) and the README install snippet
-`ref: v0.2.0 → v0.3.0`. Then the Plezy relay (item 1 below).
+**State (git-verified, RELEASED):** v0.3.0 is **merged + tagged**. PR #1
+squash-merged to `main` as `def930c`; annotated tag **`v0.3.0`** pushed at
+that commit; branch `feat/plezy-dx-v0.3.0` deleted; README install snippet
+bumped to `ref: v0.3.0` (inside the tag). Tree clean, `main` in sync. Both
+Plezy round-2 riders shipped *inside* v0.3.0 (the tag wasn't cut yet when
+they arrived — lucky timing). Consumers pin `ref: v0.3.0`.
+
+**Process note:** I told the Plezy session v0.3.0 had "shipped" before it was
+merged — a break-time note had wrongly claimed the commit was on main. It
+wasn't; it was still a PR. Acknowledged the slip to them. No harm (riders
+folded in pre-tag), but the lesson: **git-verify origin/main before saying
+"shipped"; don't trust a prior session's break-time note over `git log`.**
 
 ### Riders from Plezy verification round 2 (2026-07-20, same day)
 Plezy traced all three decisions against real data paths — all three land
@@ -86,15 +91,18 @@ unlock, but a project not a task (gomobile .aar + Kotlin plugin + proxy
 lifecycle; macOS own build; multiplies the dist/CI story). Top roadmap item.
 
 ### Next session, in order
-1. **Commit + push** this work (branch off main; nothing pushed yet), tag
-   `v0.3.0`. Then relay to Plezy: adopt `proxyPortListenable` (players),
-   `TailscaleClient` (their cupertino_http/cronet_http path), drop the tvOS
-   onError workaround, optionally `SingleIdentityTailscaleStore`.
+1. ~~Commit + push + tag v0.3.0~~ **DONE** (see State above). A full Plezy
+   reply was drafted this session (acknowledged the "shipped" slip; gave
+   adoption: hand `TailscaleClient` their CupertinoClient + `maxConnectionsPerHost:
+   12`, wire libmpv **and background_downloader** to `proxyPortListenable`,
+   drop the tvOS onError swallow, adopt `SingleIdentityTailscaleStore`). Not
+   yet confirmed landed in Plezy — follow up if they report back.
 2. Still-open older item: **real-key end-to-end** (needs user's fresh
    `tskey-auth-…` × 2) — sim `ts-browser-test`
    (9540842C-9F8C-4482-B159-85E4B2BC967C) still exists. Also the untested
    real-device short-name/system-DNS-fallback smoke test from Tailarr.
-3. Gap 5 when there's appetite for a multi-session platform push.
+3. Gap 5 (**"Android + TV input"**, incl. QR/pairing auth) when there's
+   appetite for a multi-session platform push. Top roadmap item.
 
 ## Distribution session (2026-07-20): GH Releases + history purge, PUSHED
 
