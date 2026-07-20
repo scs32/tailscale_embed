@@ -1,8 +1,31 @@
 # tailscale_embed — session notes
 
-## Feedback round 2 (2026-07-19, latest): DX items landed
+## Feedback round 2 (2026-07-19, latest): DX items landed & PUSHED
 
-Four Tailarr consumer-feedback items implemented, tested, committed:
+Four Tailarr consumer-feedback items implemented, tested, committed
+(`0f2d0a5`) and pushed to github.com/scs32/tailscale_embed main —
+consumable by Tailarr now. Session ended cleanly; nothing uncommitted.
+
+### Next session, in order
+1. Real-key end-to-end (unchanged, needs user's fresh `tskey-auth-…` × 2):
+   enroll `default` + a second identity, switch via list + Apply (now via
+   the package panel), `status().identity` tracks, key field self-empties,
+   IDENTITY_ACTIVE on deleting active. Browse `*.ts.net` + public site +
+   subnet-route IP. Bonus now: browse `http://truenas-ts/` (bare short
+   name) from the example to verify item-2 end-to-end. Sim
+   `ts-browser-test` (9540842C-9F8C-4482-B159-85E4B2BC967C) still exists.
+2. Framework distribution via GitHub Releases + script_phase (design
+   already decided — see "Maintainer session" item 3 below). Do before
+   Tailarr bumps.
+3. Tailarr side (grew this session): per-profile TAILSCALE_* fields,
+   `identity: <profileSlug>`, `ensure()` on profile switch,
+   `onKeyConsumed(identity)` (BREAKING signature), PLUS adopt
+   `restart()` (delete copied apply logic), `isEnrolled()` (delete
+   `ts_key_consumed` sentinel), `TailscaleSettingsPanel`/store or at
+   least the panel's store seam, and `FakeTailscaleBackend` for its
+   widget tests.
+
+### What landed (summary — details in commit 0f2d0a5)
 
 1. **`TailscaleSettingsPanel`** (`lib/src/settings_panel.dart`) + abstract
    `TailscaleSettingsStore` (per-identity key/hostname; consumer owns
