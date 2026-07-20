@@ -39,6 +39,12 @@ abstract class TailscaleBackend {
   /// doesn't support identities.
   Future<List<String>> listIdentities() async => const [];
 
+  /// Whether [identity] has enrolled (has persisted node state on disk).
+  /// Derived from [listIdentities] by default; backends with a cheaper
+  /// check may override.
+  Future<bool> isEnrolled(String identity) async =>
+      (await listIdentities()).contains(identity);
+
   /// Delete the on-disk node state for [identity]. Throws with code
   /// `IDENTITY_ACTIVE` when it names the currently running identity; a
   /// no-op when the identity has no state (or the backend doesn't support

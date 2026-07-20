@@ -21,7 +21,11 @@ has been running in production on iOS since July 2026.
 - **`TailscaleGuard`** re-checks node + listener health on launch/foreground
   (iOS reclaims sockets during suspension) behind a blocking overlay.
 - MagicDNS names are resolved **on-device from the node's peer list** — the
-  phone has no system MagicDNS, so the proxy does it itself.
+  phone has no system MagicDNS, so the proxy does it itself. That includes
+  bare **short names** (`truenas-ts`, not just
+  `truenas-ts.tail1234.ts.net`): dotless hostnames are routed to the proxy,
+  which resolves them from the peer list, or dials them directly via system
+  DNS when they match no peer.
 - The proxy carries **all** traffic, not just tailnet traffic: tailnet
   destinations (peer names, `100.64.0.0/10`, `fd7a:115c:a1e0::/48`) are
   dialed through tsnet, everything else through the system dialer. This
@@ -70,6 +74,37 @@ so a plaintext `tskey-auth-…` doesn't linger (the example app does this).
 `TailscaleConfig` also exposes `ephemeral`, `upTimeout` (default 45s), and
 `acceptRoutes`.
 
+If your app ships a **baked-in default key** (zero-setup first run) instead
+of keeping the key in mutable storage, use `isEnrolled(identity)` to decide
+whether the key is still needed — once it returns true, stop supplying the
+key — rather than inventing a key-was-consumed sentinel of your own.
+
+### Applying settings changes
+
+`restart()` is the one call an **Apply** button needs: it stops whatever
+node is running and starts one from the provider's current config. That
+covers both a settings change on the same identity (which `ensure()` would
+ignore — the node is already healthy) and an identity switch, with the
+usual rollback if the new config fails. `ensure()` remains the right call
+for health checks (launch/foreground) and profile switches where nothing
+else changed.
+
+### Settings panel widget
+
+`TailscaleSettingsPanel` is the whole settings UI ready-made: enabled
+switch, per-identity auth key + hostname fields with key-type validation,
+Apply with the right semantics (`restart()`/`stop()`), a connection status
+line that shows self/peers, and the enrolled-identities list. It renders as
+a plain `Column`, so it embeds in any page, and it re-reads the auth key
+from your store after apply, so a key cleared by `onKeyConsumed` empties on
+screen by itself.
+
+Back it with your own storage by implementing `TailscaleSettingsStore`
+(enabled, selected identity, per-identity key/hostname) over your
+SharedPreferences/profile object — the package never owns storage. Pass
+`showIdentity: false` when your app drives the identity from its own
+profile switcher. See `example/lib/settings.dart` for a complete store.
+
 ### Multiple identities
 
 `TailscaleConfig.identity` (default `'default'`) names the **node identity**
@@ -100,7 +135,8 @@ names); the plugin owns the on-disk layout under
   consumed (from the config the start actually used, so it's correct even
   if the provider switched mid-start). `status().identity` and
   `TailscaleEmbed.activeIdentity()` report the running identity.
-- **Cleanup**: `listIdentities()` returns names with on-disk state;
+- **Cleanup**: `listIdentities()` returns names that actually enrolled
+  (have persisted node state); `isEnrolled(name)` asks about one.
   `deleteIdentity(name)` removes one (e.g. when its profile is deleted).
   Deleting the running identity fails with `IDENTITY_ACTIVE`.
 
@@ -131,6 +167,16 @@ app reconnects without a new auth key. If that doesn't fit your threat
 model, use `ephemeral: true` (no persisted identity, key required every
 start) or exclude the `tailscale/` state directory from backups in your app.
 With multiple identities, every enrolled identity's state is backed up.
+
+### Testing consumers
+
+`FakeTailscaleBackend` is an in-memory backend for widget/unit tests — no
+MethodChannel, no device. Pass it to `configure(backend: …)` and the whole
+facade (start/ensure/stop, identity switching, `onKeyConsumed`, status)
+behaves like a node that always comes up. Knobs: `startError` (auth-failure
+paths), `statusOverride` (peer lists, health), `enrolled` (pre-seeded
+identities), plus `startedConfigs` recording for assertions. This package's
+own `test/` uses it, including pumping `TailscaleSettingsPanel`.
 
 ## Example app
 

@@ -74,6 +74,10 @@ class MethodChannelTailscaleBackend implements TailscaleBackend {
   }
 
   @override
+  Future<bool> isEnrolled(String identity) async =>
+      (await listIdentities()).contains(identity);
+
+  @override
   Future<void> deleteIdentity(String identity) async {
     await _channel.invokeMethod('deleteIdentity', {'identity': identity});
   }

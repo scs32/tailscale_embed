@@ -10,6 +10,8 @@ export 'src/auth_keys.dart';
 export 'src/backend.dart';
 export 'src/config.dart';
 export 'src/embed.dart';
+export 'src/fake_backend.dart';
 export 'src/guard.dart';
 export 'src/method_channel_backend.dart';
+export 'src/settings_panel.dart';
 export 'src/status.dart';

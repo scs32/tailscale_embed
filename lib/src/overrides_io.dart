@@ -27,13 +27,25 @@ bool isTailscaleHost(String host) {
       v6[5] == 0xe0;
 }
 
-/// A `findProxy` callback that sends tailnet destinations to the embedded
-/// node's local proxy and everything else direct. The port is read on every
-/// request so clients created before the proxy started (or across a rebind)
-/// always use the current port.
+/// Returns true if [host] might be a MagicDNS short name: a bare single
+/// label (`truenas-ts`), not an IP literal. The embedded node's proxy
+/// resolves these from its own peer list (the device has no system-wide
+/// MagicDNS); a name that matches no peer is dialed directly by the proxy
+/// via system DNS, so sending it there is safe either way.
+bool isPossibleTailnetShortName(String host) {
+  if (host.isEmpty || host.contains('.') || host.contains(':')) return false;
+  return InternetAddress.tryParse(host) == null;
+}
+
+/// A `findProxy` callback that sends tailnet destinations — including bare
+/// MagicDNS short names like `truenas-ts`, which only the embedded node can
+/// resolve — to the local proxy, and everything else direct. The port is
+/// read on every request so clients created before the proxy started (or
+/// across a rebind) always use the current port.
 String tailscaleFindProxy(Uri uri) {
   final port = TailscaleEmbed.instance.proxyPort;
-  if (port != null && isTailscaleHost(uri.host)) {
+  if (port != null &&
+      (isTailscaleHost(uri.host) || isPossibleTailnetShortName(uri.host))) {
     return 'PROXY 127.0.0.1:$port';
   }
   return 'DIRECT';

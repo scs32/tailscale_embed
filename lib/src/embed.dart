@@ -26,10 +26,23 @@ class TailscaleEmbed {
   /// atomic from callers' point of view: an `ensure()` arriving while a
   /// switch is in flight (e.g. TailscaleGuard on app resume) waits for it,
   /// then health-checks whichever identity won.
-  Future<void> _serial = Future.value();
+  ///
+  /// Null when idle — an op arriving then runs immediately in the caller's
+  /// zone, and the chain resets to null once it drains. Holding a permanent
+  /// completed future here would pin every op to the zone that first
+  /// touched the singleton (Dart runs a future's listeners on the future's
+  /// own zone): under `testWidgets` FakeAsync that strands the whole chain
+  /// outside the fake zone whenever `configure` ran in `setUp`, and `pump`
+  /// can never complete a `start()`.
+  Future<void>? _serial;
+  int _serialDepth = 0;
   Future<T> _serialized<T>(Future<T> Function() op) {
-    final run = _serial.then((_) => op());
-    _serial = run.then((_) {}, onError: (_) {});
+    _serialDepth++;
+    final prev = _serial;
+    final run = prev == null ? Future<T>.sync(op) : prev.then((_) => op());
+    _serial = run.then((_) {}, onError: (_) {}).whenComplete(() {
+      if (--_serialDepth == 0) _serial = null;
+    });
     return run;
   }
 
@@ -87,6 +100,16 @@ class TailscaleEmbed {
     return port;
   }
 
+  /// Apply the provider's current config: stop whatever node is running and
+  /// start one from the config. This is the one call an "Apply" button needs
+  /// — it covers both a settings change on the same identity (which
+  /// [ensure] would ignore, since the node is already healthy) and an
+  /// identity switch. The native start already stops the running node before
+  /// bringing up the new one, and rolls back to it if the new config fails
+  /// (see [start]), so this is [start] under a name that reads correctly at
+  /// apply-settings call sites.
+  Future<int> restart() => _serialized(_start);
+
   /// Ensure the node is up and its local listener is healthy, starting or
   /// rebinding as needed (iOS reclaims sockets during suspension). When the
   /// config provider now names a different identity than the running node,
@@ -130,6 +153,12 @@ class TailscaleEmbed {
 
   /// Identity names with on-disk node state, for cleanup UIs.
   Future<List<String>> listIdentities() => _backend.listIdentities();
+
+  /// Whether [identity] has enrolled — its node identity persists on disk,
+  /// so it can start without an auth key. Lets an app with a baked-in
+  /// default key decide "still need the key?" without inventing a
+  /// key-was-consumed sentinel of its own.
+  Future<bool> isEnrolled(String identity) => _backend.isEnrolled(identity);
 
   /// Delete the on-disk node state for [identity] (e.g. when the profile it
   /// belonged to is deleted, so orphaned identities don't accumulate).

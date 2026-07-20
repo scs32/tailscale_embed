@@ -251,14 +251,17 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
             return
         }
         let fm = FileManager.default
+        // Only identities that actually enrolled count — tailscaled.state is
+        // the persisted node identity. The state dir itself is created
+        // eagerly before a start, so a dir without it is just the residue of
+        // a failed enrollment, not an identity. (This also backs
+        // `isEnrolled` on the Dart side.)
         let names = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? [])
             .filter { name in
-                var isDir: ObjCBool = false
-                return Self.isValidIdentity(name)
+                Self.isValidIdentity(name)
                     && fm.fileExists(
-                        atPath: dir.appendingPathComponent(name).path,
-                        isDirectory: &isDir)
-                    && isDir.boolValue
+                        atPath: dir.appendingPathComponent(name)
+                            .appendingPathComponent("tailscaled.state").path)
             }
         result(names.sorted())
     }

@@ -1,5 +1,47 @@
 # tailscale_embed — session notes
 
+## Feedback round 2 (2026-07-19, latest): DX items landed
+
+Four Tailarr consumer-feedback items implemented, tested, committed:
+
+1. **`TailscaleSettingsPanel`** (`lib/src/settings_panel.dart`) + abstract
+   `TailscaleSettingsStore` (per-identity key/hostname; consumer owns
+   storage) + `TailscaleEmbed.restart()`. Key insight: the example's
+   "subtle apply logic" (ensure-vs-stop/start branch) was never needed —
+   native start already stops the running node first, so `restart()`
+   (≡ start) covers same-identity config changes AND identity switches.
+   Example settings page refactored onto the panel (~20 lines now).
+   `showIdentity: false` hides identity UI for profile-driven apps.
+2. **Bare short names** (`truenas-ts`): Go `matchNode` already resolved
+   them — the footgun was Dart-side; `tailscaleFindProxy` now routes
+   dotless non-IP hosts to the proxy (`isPossibleTailnetShortName`),
+   which resolves from peers or dials direct via system DNS. Pure Dart,
+   NO xcframework rebuild.
+3. **`isEnrolled(identity)`** on embed + backend seam (derived from
+   `listIdentities`). Swift `listIdentities` now requires
+   `tailscaled.state` (failed-start residue dirs no longer count) —
+   that's what makes it trustworthy for baked-in-key apps (kills
+   Tailarr's `ts_key_consumed` sentinel).
+4. **`FakeTailscaleBackend`** (exported) + first `test/` suite: 11 unit +
+   5 panel widget tests, `flutter test` green, analyze clean both.
+
+**Gotchas learned** (test-infra, worth remembering):
+- `pumpAndSettle` never settles after `enterText` — focused field's
+  cursor-blink timer reschedules frames forever. Use `pump()`.
+- The old `_serial = Future.value()` singleton field pinned all
+  serialized ops to the zone that FIRST touched `TailscaleEmbed.instance`
+  (Dart runs a future's listeners on the future's own zone). With
+  `configure()` in test `setUp` (real zone), `testWidgets` FakeAsync
+  could never complete `start()` → 10-min timeouts + cross-test hangs.
+  Fixed in `_serialized`: chain is nullable, ops run in caller's zone
+  when idle, resets to null when drained. Tailarr consumers configuring
+  in setUp would have hit this.
+
+Still outstanding from previous backlog: real-key end-to-end (item 1
+below), framework distribution via GH Releases (item 2), Tailarr-side
+adoption (item 3 — now also: adopt the panel or at least `restart()`,
+`isEnrolled`, drop slugified short-name docs caveat).
+
 ## Multi-identity session (2026-07-19, later): identities landed & pushed
 
 Tailarr's feature request implemented, committed (`efc0e02`) and PUSHED to
