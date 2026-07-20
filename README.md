@@ -56,7 +56,7 @@ dependencies:
   tailscale_embed:
     git:
       url: https://github.com/scs32/tailscale_embed.git
-      ref: v0.2.0
+      ref: v0.3.0
 ```
 
 Pin a version tag rather than `main` or a commit hash: tags communicate
