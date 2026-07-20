@@ -10,7 +10,7 @@ end
 
 Pod::Spec.new do |s|
   s.name             = 'tailscale_embed'
-  s.version          = '0.1.0'
+  s.version          = '0.2.0'
   s.summary          = 'Embedded Tailscale (tsnet) node for Flutter apps'
   s.description      = <<-DESC
 Embeds a Tailscale node (Go tsnet via gomobile) in the app and exposes a

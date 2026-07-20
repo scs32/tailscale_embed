@@ -16,6 +16,7 @@ if [ -f .framework-local ] && [ -d "$FW" ]; then
   exit 0
 fi
 if [ -d "$FW" ] && [ -f .framework-tag ] && [ "$(cat .framework-tag)" = "$TAG" ]; then
+  echo "tailscale_embed: using cached $FW ($TAG)"
   exit 0
 fi
 

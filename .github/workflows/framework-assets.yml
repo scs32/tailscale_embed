@@ -1,0 +1,44 @@
+# Guard the load-bearing "never delete old release assets" rule: every
+# Framework.lock that has ever existed in history must still resolve to a
+# downloadable, checksum-matching release asset — otherwise some historical
+# commit (and any consumer pinned to it) can no longer build.
+name: framework-assets
+on:
+  schedule:
+    - cron: '17 6 * * 1' # weekly, Monday 06:17 UTC
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify every historical Framework.lock pin
+        run: |
+          set -eu
+          fail=0
+          # Every distinct content-version of ios/Framework.lock in history.
+          for blob in $(git log --all --format=%H -- ios/Framework.lock \
+                        | while read -r c; do git rev-parse -q --verify "$c:ios/Framework.lock" || true; done \
+                        | sort -u); do
+            TAG=''; ZIP=''; SHA256=''
+            eval "$(git cat-file blob "$blob")"
+            url="https://github.com/${GITHUB_REPOSITORY}/releases/download/$TAG/$ZIP"
+            echo "checking $TAG ..."
+            if ! curl -fsSL --retry 3 -o asset.zip "$url"; then
+              echo "::error::$TAG: asset missing or undownloadable ($url)"
+              fail=1
+              continue
+            fi
+            actual="$(shasum -a 256 asset.zip | awk '{print $1}')"
+            if [ "$actual" != "$SHA256" ]; then
+              echo "::error::$TAG: SHA-256 mismatch (expected $SHA256, got $actual)"
+              fail=1
+            else
+              echo "  ok ($SHA256)"
+            fi
+            rm -f asset.zip
+          done
+          exit $fail

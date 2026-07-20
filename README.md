@@ -51,14 +51,26 @@ Not on pub.dev — add it as a git dependency:
 ```yaml
 dependencies:
   tailscale_embed:
-    git: https://github.com/scs32/tailscale_embed.git
+    git:
+      url: https://github.com/scs32/tailscale_embed.git
+      ref: v0.2.0
 ```
+
+Pin a version tag rather than `main` or a commit hash: tags communicate
+compatibility (pre-1.0, a minor bump means breaking API changes) and
+survive history maintenance that raw hashes may not.
 
 That's the only step. The ~90MB prebuilt `TailscaleEmbed.xcframework` is not
 in the repo (clones are tiny); it downloads automatically — SHA-256 verified
 and cached — during `pod install` on the first iOS build. See
 [The prebuilt framework](#the-prebuilt-framework) for details and the
 offline from-source fallback.
+
+Note: for git dependencies the framework lands inside the pub cache
+checkout, which pub nominally treats as immutable — `dart pub cache repair`
+or clearing the cache silently drops it. Harmless: the next `pod install`
+re-downloads. If a build ever complains the framework is missing, that's
+why.
 
 ## Usage
 
@@ -226,6 +238,13 @@ go/build.sh --publish  # also upload a new release + update Framework.lock
 ```
 
 After `--publish`, commit the updated `ios/Framework.lock`.
+
+**Releasing**: bump `version:` in `pubspec.yaml` (mirror it in the podspec)
+and push a matching `v<version>` git tag whenever the Dart API changes —
+pre-1.0, breaking changes bump the minor version. A weekly CI job
+(`framework-assets.yml`) re-downloads every release asset any historical
+`Framework.lock` has pinned and verifies its SHA-256, so an accidental
+asset deletion is caught before it breaks a consumer's build.
 
 **Gotcha:** gvisor must match tailscale's own go.mod pin — a newer gvisor
 breaks `gomobile bind` with "found packages stack and bridge" errors.

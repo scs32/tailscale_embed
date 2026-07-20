@@ -32,12 +32,35 @@ the real path: framework deleted + Pods/Podfile.lock wiped → `flutter build
 ios --simulator` in example/ downloads during `pod install` and builds.
 `flutter test` 16/16 green.
 
+### Tailarr feedback round 3 (2026-07-20, same day): all landed
+Tailarr build 8 shipped on the new pipeline (CI + local pod install both
+downloaded/verified framework-v1.92.5 first try; bump from efc0e02-era to
+39b8afd needed zero Dart changes). Its four suggestions implemented here:
+- **Semver tags**: version 0.2.0 (pubspec + podspec), tag `v0.2.0` pushed.
+  Policy in README: consumers pin `ref: v<version>`, not hashes/main;
+  pre-1.0 breaking API = minor bump; tag on every Dart API change.
+- **Cache-hit log line** in download_framework.sh (provenance always
+  visible in CI, not just on first download).
+- **`.github/workflows/framework-assets.yml`**: weekly + manual; walks
+  EVERY historical version of ios/Framework.lock in git history and
+  re-downloads + SHA-256-verifies each pinned asset — enforces the
+  "never delete old release assets" rule before a consumer breaks.
+- **Pub-cache caveat** in README: framework lives inside the pub-cache git
+  checkout; `dart pub cache repair`/cache clean silently drops it; next
+  pod install re-downloads.
+Outstanding from that feedback: relay Stephen's real-device short-name
+smoke test (`http://truenas-ts/` on build 8) back here — it's the first
+real-device exercise of the short-name fix; the system-DNS-fallback half
+is the untested part.
+
 ### Next session, in order
 1. Real-key end-to-end (unchanged — see feedback-round-2 notes below):
    needs user's fresh `tskey-auth-…` × 2. Sim `ts-browser-test`
    (9540842C-9F8C-4482-B159-85E4B2BC967C) still exists.
-2. Tailarr side (see below), PLUS: bump its git dep to a post-rewrite hash
-   (old pins are dead), and it now clones ~134KB instead of 180MB.
+2. Tailarr side: remaining adoption is optional DX (restart(),
+   isEnrolled, settings panel/store seam, FakeTailscaleBackend in its
+   tests) + surfacing status() in Settings > Network. Its next bump
+   should switch to `ref: v0.2.0` style pins.
 
 ## Feedback round 2 (2026-07-19): DX items landed & PUSHED
 
