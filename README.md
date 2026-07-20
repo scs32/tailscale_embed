@@ -44,6 +44,22 @@ has been running in production on iOS since July 2026.
   auth key, timeout), the plugin rolls back to the previously-working node
   instead of leaving the user with no tunnel.
 
+## Installation
+
+Not on pub.dev — add it as a git dependency:
+
+```yaml
+dependencies:
+  tailscale_embed:
+    git: https://github.com/scs32/tailscale_embed.git
+```
+
+That's the only step. The ~90MB prebuilt `TailscaleEmbed.xcframework` is not
+in the repo (clones are tiny); it downloads automatically — SHA-256 verified
+and cached — during `pod install` on the first iOS build. See
+[The prebuilt framework](#the-prebuilt-framework) for details and the
+offline from-source fallback.
+
 ## Usage
 
 ```dart
