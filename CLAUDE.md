@@ -1,6 +1,70 @@
 # tailscale_embed — session notes
 
-## Distribution session (2026-07-20, latest): GH Releases + history purge, PUSHED
+## Plezy feedback session (2026-07-20, latest): drop-in DX gaps, v0.3.0, NOT yet pushed
+
+Plezy (edde746/plezy, ~2900★ cross-platform Plex/Jellyfin client) integrated
+v0.2.0 and filed 7 gaps. Gatekeeper triage (kept surface crisp): built the
+pure-Dart / DX ones, deferred the big platform work. **No xcframework
+rebuild** — all changes are Dart + docs. `flutter analyze` clean (pkg +
+example), `flutter test` 23/23 green. Version bumped 0.2.0 → **0.3.0**
+(additive API, non-breaking) in pubspec + podspec. NOT committed/pushed yet.
+
+### What landed
+- **Gap 2 — proxy-port listenable (highest ROI):** `TailscaleEmbed.instance
+  .proxyPortListenable` (`ValueListenable<int?>`), fires on start/rebind/stop.
+  `_proxyPort` is now a `ValueNotifier`. The missing primitive for anything
+  that *bakes in* the port (native URLSession/OkHttp, loaded libmpv,
+  AVPlayer/ExoPlayer) vs. `findProxy` which reads it live.
+- **Gap 1 — client-agnostic CONNECT wrapper:** new opt-in entrypoint
+  `lib/tailscale_embed_http.dart` → `TailscaleClient(inner)` (an
+  `http.BaseClient`). Tailnet hosts (incl. short names) route via an internal
+  `dart:io` `IOClient`+`findProxy`; everything else delegates to `inner`, so
+  apps keep their native client (cupertino_http/cronet_http/win_http) for
+  public traffic. Design choice: delegate, do NOT hand-roll CONNECT/TLS.
+  **Rejected** the native per-client proxy-factory sub-request (too much
+  per-platform native surface). Added `http: >=0.13.0 <2.0.0` dep (core never
+  imports it). Corrected the false "http & Dio just ride dart:io → zero
+  changes" README claim.
+- **Gap 4 — tvOS isSupported (correctness bug):** tvOS reports as
+  `TargetPlatform.iOS` but the plugin isn't registered → was throwing
+  MissingPluginException. No web-safe sync tvOS signal exists, so:
+  `MethodChannelTailscaleBackend` now catches MissingPluginException on the
+  first call, latches a static `_pluginMissing`, `isSupported` then returns
+  false, lifecycle probes (isRunning/status/listIdentities/ensure) degrade to
+  quiet no-ops, and an explicit start() throws the new stable
+  `UNSUPPORTED` code (`TailscaleErrorCodes.unsupported` + friendlyError).
+- **Gap 7 — `SingleIdentityTailscaleStore`** (in settings_panel.dart): pure
+  base collapsing the per-identity store API to three plain pairs
+  (enabled/authKey/hostname), identity pinned to 'default'. No dep. **Did NOT**
+  ship a SharedPreferences concrete store (would break "package owns no
+  storage" + add a dep) — kept it opt-in-only-if-ever.
+- **Docs (Gaps 3 & 6):** README gained "Routing native HTTP clients"
+  (TailscaleClient), "Routing native media players" (mpv `http-proxy` recipe +
+  proxyPortListenable rebind + ffmpeg-resolves-proxy-side note), and "Client
+  lifetime and enabling mid-session" (live-port vs baked-in ordering).
+  Platforms section now documents the no-op-everywhere + tvOS behavior and
+  flags Android/macOS as the top roadmap item.
+- **Tests:** +proxyPortListenable, +SingleIdentityTailscaleStore,
+  +unsupported-platform latch (needs `TestWidgetsFlutterBinding
+  .ensureInitialized()` + `debugDefaultTargetPlatformOverride`), new
+  `test/tailscale_client_test.dart` (routing/delegation/close via MockClient).
+
+### DEFERRED — Gap 5 (Android + macOS backends): the real "drop into anything"
+unlock, but a project not a task (gomobile .aar + Kotlin plugin + proxy
+lifecycle; macOS own build; multiplies the dist/CI story). Top roadmap item.
+
+### Next session, in order
+1. **Commit + push** this work (branch off main; nothing pushed yet), tag
+   `v0.3.0`. Then relay to Plezy: adopt `proxyPortListenable` (players),
+   `TailscaleClient` (their cupertino_http/cronet_http path), drop the tvOS
+   onError workaround, optionally `SingleIdentityTailscaleStore`.
+2. Still-open older item: **real-key end-to-end** (needs user's fresh
+   `tskey-auth-…` × 2) — sim `ts-browser-test`
+   (9540842C-9F8C-4482-B159-85E4B2BC967C) still exists. Also the untested
+   real-device short-name/system-DNS-fallback smoke test from Tailarr.
+3. Gap 5 when there's appetite for a multi-session platform push.
+
+## Distribution session (2026-07-20): GH Releases + history purge, PUSHED
 
 Backlog item 2 (framework distribution) is DONE. Repo history was rewritten
 (git filter-repo --strip-blobs-bigger-than 10M) and force-pushed: `.git`

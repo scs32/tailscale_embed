@@ -3,7 +3,7 @@ description: >-
   Embed a Tailscale (tsnet) node inside a Flutter app and route tailnet
   traffic (*.ts.net, 100.64.0.0/10, fd7a:115c:a1e0::/48) through it via a
   local HTTP CONNECT proxy — no system VPN profile required.
-version: 0.2.0
+version: 0.3.0
 homepage: https://github.com/scs32/tailscale_embed
 publish_to: none
 
@@ -14,6 +14,9 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  # Used only by the opt-in `tailscale_embed_http.dart` entrypoint
+  # (TailscaleClient). The core library never imports it.
+  http: ">=0.13.0 <2.0.0"
 
 dev_dependencies:
   flutter_test:

@@ -27,6 +27,62 @@ abstract class TailscaleSettingsStore {
   void setHostname(String identity, String value);
 }
 
+/// A [TailscaleSettingsStore] for the common single-tailnet app: one node, no
+/// identity switching. Implement just the three plain pairs — [enabled],
+/// [authKey], [hostname] — over your own storage; this collapses the
+/// per-identity API onto them and pins [identity] to `'default'`.
+///
+/// Pair it with `TailscaleSettingsPanel(store: ..., showIdentity: false)`, and
+/// have your `TailscaleConfigProvider` read the same three values:
+///
+/// ```dart
+/// class MyStore extends SingleIdentityTailscaleStore {
+///   final SharedPreferences prefs;
+///   MyStore(this.prefs);
+///   @override bool get enabled => prefs.getBool('ts_enabled') ?? false;
+///   @override set enabled(bool v) => prefs.setBool('ts_enabled', v);
+///   @override String get authKey => prefs.getString('ts_key') ?? '';
+///   @override set authKey(String v) => prefs.setString('ts_key', v);
+///   @override String get hostname => prefs.getString('ts_host') ?? 'my-app';
+///   @override set hostname(String v) => prefs.setString('ts_host', v);
+/// }
+/// ```
+abstract class SingleIdentityTailscaleStore implements TailscaleSettingsStore {
+  @override
+  bool get enabled;
+  @override
+  set enabled(bool value);
+
+  /// The single node's auth key.
+  String get authKey;
+  set authKey(String value);
+
+  /// The single node's tailnet hostname.
+  String get hostname;
+  set hostname(String value);
+
+  @override
+  String get identity => 'default';
+
+  @override
+  set identity(String value) {
+    // Single-identity: there is nothing to switch to. Ignored so the panel's
+    // Apply path (which always writes identity) is a no-op here.
+  }
+
+  @override
+  String authKeyFor(String identity) => authKey;
+
+  @override
+  void setAuthKey(String identity, String value) => authKey = value;
+
+  @override
+  String hostnameFor(String identity) => hostname;
+
+  @override
+  void setHostname(String identity, String value) => hostname = value;
+}
+
 /// A ready-made Tailscale settings panel: enabled switch, per-identity auth
 /// key and hostname fields with key-type validation, an Apply button with
 /// the right apply semantics (`restart()` when enabled — which covers both

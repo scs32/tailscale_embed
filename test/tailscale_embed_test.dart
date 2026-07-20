@@ -1,9 +1,11 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:tailscale_embed/tailscale_embed.dart';
 import 'package:tailscale_embed/tailscale_embed_io.dart';
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
   final embed = TailscaleEmbed.instance;
   late FakeTailscaleBackend backend;
   late TailscaleConfig config;
@@ -22,6 +24,18 @@ void main() {
     expect(embed.proxyPort, backend.port);
     expect(backend.startedConfigs.single.authKey, 'tskey-auth-x');
     expect(await embed.isRunning(), isTrue);
+  });
+
+  test('proxyPortListenable fires on start and clears on stop', () async {
+    final events = <int?>[];
+    void listener() => events.add(embed.proxyPort);
+    embed.proxyPortListenable.addListener(listener);
+    addTearDown(() => embed.proxyPortListenable.removeListener(listener));
+
+    await embed.start();
+    await embed.stop();
+
+    expect(events, [backend.port, null]);
   });
 
   test('onKeyConsumed fires with the identity for persistent nodes',
@@ -141,4 +155,68 @@ void main() {
       expect(isPossibleTailnetShortName(''), isFalse);
     });
   });
+
+  group('SingleIdentityTailscaleStore', () {
+    test('collapses the per-identity API onto three plain values', () {
+      final store = _FakeSingleStore()
+        ..enabled = true
+        ..authKey = 'tskey-auth-x'
+        ..hostname = 'my-app';
+
+      // Identity is pinned and unswitchable.
+      expect(store.identity, 'default');
+      store.identity = 'ignored';
+      expect(store.identity, 'default');
+
+      // Per-identity accessors ignore the identity arg and hit the plain slot.
+      expect(store.authKeyFor('whatever'), 'tskey-auth-x');
+      expect(store.hostnameFor('whatever'), 'my-app');
+      store.setAuthKey('whatever', 'tskey-auth-y');
+      store.setHostname('whatever', 'renamed');
+      expect(store.authKey, 'tskey-auth-y');
+      expect(store.hostname, 'renamed');
+    });
+  });
+
+  group('unsupported platform (missing native plugin)', () {
+    // The default MethodChannel backend has no registered handler in tests, so
+    // invokeMethod throws MissingPluginException — exactly the tvOS situation.
+    test('latches to unsupported and surfaces a typed UNSUPPORTED error',
+        () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+
+      const channelBackend = MethodChannelTailscaleBackend();
+      // Optimistic on the iOS-family target until a call proves otherwise.
+      expect(channelBackend.isSupported, isTrue);
+
+      // Lifecycle probes degrade to a quiet no-op (no throw) and latch.
+      expect(await channelBackend.isRunning(), isFalse);
+      expect(channelBackend.isSupported, isFalse);
+      expect(await channelBackend.status(), isNull);
+      expect(await channelBackend.listIdentities(), isEmpty);
+
+      // An explicit start now fails with the stable UNSUPPORTED code.
+      expect(
+        () => channelBackend
+            .start(const TailscaleConfig(enabled: true, authKey: '')),
+        throwsA(isA<PlatformException>().having(
+            (e) => e.code, 'code', TailscaleErrorCodes.unsupported)),
+      );
+      expect(
+        TailscaleAuthKeys.friendlyError(
+            PlatformException(code: TailscaleErrorCodes.unsupported)),
+        contains('not available on this device'),
+      );
+    });
+  });
+}
+
+class _FakeSingleStore extends SingleIdentityTailscaleStore {
+  @override
+  bool enabled = false;
+  @override
+  String authKey = '';
+  @override
+  String hostname = '';
 }
