@@ -1,6 +1,45 @@
 # tailscale_embed — session notes
 
-## Feedback round 2 (2026-07-19, latest): DX items landed & PUSHED
+## Distribution session (2026-07-20, latest): GH Releases + history purge, PUSHED
+
+Backlog item 2 (framework distribution) is DONE. Repo history was rewritten
+(git filter-repo --strip-blobs-bigger-than 10M) and force-pushed: `.git`
+went 180MB → ~134KB. **All commit hashes before this session changed** —
+any other checkout, and any Tailarr pubspec.lock pinning an old hash, must
+re-clone / re-resolve.
+
+### How it works now
+- xcframework is NOT in git. `ios/download_framework.sh` fetches the zip
+  pinned in `ios/Framework.lock` (TAG/ZIP/SHA256) from GitHub Releases,
+  verifies SHA-256, caches via `ios/.framework-tag`.
+- The podspec runs the script at **podspec-eval time** (top of the file).
+  NOT prepare_command (skipped for development pods = all Flutter plugins)
+  and NOT script_phase (the earlier design — too late: CocoaPods needs the
+  .xcframework at pod-install time for slice selection/linking). This was
+  the one deviation from the previously decided design.
+- `go/build.sh` = build from source + install locally, writes
+  `ios/.framework-local` so the download script won't clobber it.
+  `go/build.sh --publish` = also zip, `gh release create` under an
+  immutable tag `framework-v<ts-version>[-N]` (never reuses a tag), and
+  rewrite Framework.lock → commit it. One command, no manual ritual.
+- **NEVER delete old release assets** — every historical commit's pin must
+  stay downloadable. Current release: `framework-v1.92.5` (created against
+  post-rewrite main so the tag doesn't resurrect purged history).
+
+### Verified this session
+Standalone download, cache no-op, checksum-mismatch refusal (exit 1), and
+the real path: framework deleted + Pods/Podfile.lock wiped → `flutter build
+ios --simulator` in example/ downloads during `pod install` and builds.
+`flutter test` 16/16 green.
+
+### Next session, in order
+1. Real-key end-to-end (unchanged — see feedback-round-2 notes below):
+   needs user's fresh `tskey-auth-…` × 2. Sim `ts-browser-test`
+   (9540842C-9F8C-4482-B159-85E4B2BC967C) still exists.
+2. Tailarr side (see below), PLUS: bump its git dep to a post-rewrite hash
+   (old pins are dead), and it now clones ~134KB instead of 180MB.
+
+## Feedback round 2 (2026-07-19): DX items landed & PUSHED
 
 Four Tailarr consumer-feedback items implemented, tested, committed
 (`0f2d0a5`) and pushed to github.com/scs32/tailscale_embed main —
