@@ -3,7 +3,7 @@ PODS:
   - shared_preferences_foundation (0.0.1):
     - Flutter
     - FlutterMacOS
-  - tailscale_embed (0.1.0):
+  - tailscale_embed (0.3.1):
     - Flutter
   - webview_flutter_wkwebview (0.0.1):
     - Flutter
@@ -28,7 +28,7 @@ EXTERNAL SOURCES:
 SPEC CHECKSUMS:
   Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
   shared_preferences_foundation: 7036424c3d8ec98dfe75ff1667cb0cd531ec82bb
-  tailscale_embed: 6306b380f2c566f0cfba8801b55a3355f395d043
+  tailscale_embed: f02a9de0b1838b814122cdcae0fde27164b8922a
   webview_flutter_wkwebview: 8ebf4fded22593026f7dbff1fbff31ea98573c8d
 
 PODFILE CHECKSUM: 3c63482e143d1b91d2d2560aee9fb04ecc74ac7e

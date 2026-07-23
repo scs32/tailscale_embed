@@ -217,7 +217,9 @@ func (t *Tailscale) StartProxy() (int, error) {
 
 // EnsureProxy verifies the local proxy listener is still accepting
 // connections (iOS reclaims sockets during app suspension) and rebinds it on
-// a fresh port if it died. Returns the current (possibly new) proxy port.
+// a fresh port if it died. It also rebinds magicsock's UDP sockets, which iOS
+// parks independently of the proxy listener. Returns the current (possibly
+// new) proxy port.
 func (t *Tailscale) EnsureProxy() (int, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -225,6 +227,13 @@ func (t *Tailscale) EnsureProxy() (int, error) {
 	if !t.running {
 		return 0, codedErr(ErrCodeNotRunning, errors.New("tailscale is not running"))
 	}
+
+	// The proxy listener surviving suspension says nothing about magicsock's
+	// UDP sockets — without a rebind the node can come back with dead receive
+	// loops ("the MagicSock function ReceiveIPv4 is not running" health
+	// warning) and silently fall back to DERP relay. Rebind unconditionally,
+	// as the official iOS client does on wake.
+	t.rebindMagicsock()
 
 	// Health check: can we reach our own listener?
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", t.proxyPort), 2*time.Second)
@@ -250,6 +259,31 @@ func (t *Tailscale) EnsureProxy() (int, error) {
 	}()
 	log.Printf("[proxy] rebound on 127.0.0.1:%d", t.proxyPort)
 	return t.proxyPort, nil
+}
+
+// rebindMagicsock closes and re-binds magicsock's UDP sockets and re-runs
+// STUN endpoint discovery (Rebind's doc requires the follow-up ReSTUN). It
+// then drops the cached status so the next StatusJSON re-reads health instead
+// of serving the pre-rebind warning. Safe to call on an instance that never
+// started (tsnet populates Sys() only during start).
+func (t *Tailscale) rebindMagicsock() {
+	if t.server == nil {
+		return
+	}
+	sys := t.server.Sys()
+	if sys == nil {
+		return
+	}
+	ms, ok := sys.MagicSock.GetOK()
+	if !ok {
+		return
+	}
+	ms.Rebind()
+	ms.ReSTUN("tsembed-resume")
+	t.stMu.Lock()
+	t.st = nil
+	t.stMu.Unlock()
+	log.Printf("[tsnet] magicsock rebound (resume)")
 }
 
 // StopProxy stops the HTTP proxy and tsnet server.

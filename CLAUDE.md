@@ -1,6 +1,62 @@
 # tailscale_embed — session notes
 
-## Plezy feedback session (2026-07-20, latest): drop-in DX gaps, v0.3.0
+## Magicsock resume-rebind session (2026-07-23, latest): v0.3.1
+
+**Bug (Tailarr, confirmed twice on real devices):** after iOS suspend/resume
+the node reported the health warning "The MagicSock function ReceiveIPv4 is
+not running" (tailscale#10976 class). Traffic still worked but silently
+degraded to DERP relay; only a stop/start cleared it. Root cause: the resume
+path (`TailscaleGuard` → `ensure()` → Go `EnsureProxy()`) only health-checked
+the local proxy listener — it never rebound magicsock's UDP sockets, which
+iOS parks independently.
+
+**Fix (Go-only, `go/main.go`):** `EnsureProxy()` now calls a new
+`rebindMagicsock()` unconditionally (even when the proxy listener survived):
+`server.Sys().MagicSock.GetOK()` → `Conn.Rebind()` + `ReSTUN("tsembed-resume")`
+(Rebind's doc requires the follow-up ReSTUN; matches the official iOS
+client's wake path), then drops the 3s status cache so the next StatusJSON
+re-reads health instead of serving the stale warning. Nil-safe pre-start
+(`Sys()` is nil until tsnet starts). Note: `tsnet.Server.Sys()` is
+documented as "not a stable API" — re-check it on tailscale bumps.
+
+**Verified:** `go test` green (+2 tests: rebind nil-safety, EnsureProxy
+NOT_RUNNING), `flutter analyze` clean, `flutter test` 24/24, example
+`flutter build ios --simulator` links the rebuilt framework. The real
+health-warning-clears-on-resume check needs a running node with a real auth
+key — NOT yet done (same blocker as the standing real-key e2e item); Tailarr
+can confirm via its Status page after bumping.
+
+**Released:** version 0.3.1 (pubspec + podspec), framework republished via
+`go/build.sh --publish` (new immutable `framework-v1.92.5-N` tag,
+Framework.lock updated), tag `v0.3.1`, README ref bumped. Tailarr bumps with
+`ref: v0.3.1`.
+
+**build.sh gotcha (fixed this session):** the publish step's TS_VERSION grep
+(`awk '{print $2}'` on the go.mod require line) broke when `go mod tidy`
+collapsed the require block to single-line form — it published a bogus
+`framework-vtailscale.com` release (deleted immediately; safe, nothing ever
+pinned it — the never-delete rule protects tags committed in Framework.lock
+history, which this never was). Now uses
+`go list -m -f '{{.Version}}' tailscale.com` + a sanity check.
+
+**Consumer FYIs from Tailarr (2026-07-23):**
+- Bare-short-name routing fix (39b8afd) passed a real-device smoke test
+  2026-07-22 — that standing verification item is CLOSED (the
+  system-DNS-fallback half for non-peer dotless names remains untested).
+- `FakeTailscaleBackend` has its first external consumer: Tailarr's
+  `integration_test/tailscale_status_page_test.dart`. Its API is now a
+  compatibility surface — keep stable or version bumps deliberately.
+- Tailarr has a Tailscale Status page surfacing `status()` health warnings
+  (that's what caught this bug).
+
+### Next session, in order
+1. Real-key end-to-end (unchanged, needs user's fresh `tskey-auth-…` × 2) —
+   now also covers the suspend/resume health-clear check for this fix. Sim
+   `ts-browser-test` (9540842C-9F8C-4482-B159-85E4B2BC967C) still exists.
+2. Follow up on Plezy adoption of v0.3.0 reply (not yet confirmed landed).
+3. Gap 5 ("Android + TV input", incl. QR/pairing auth) — top roadmap item.
+
+## Plezy feedback session (2026-07-20): drop-in DX gaps, v0.3.0
 
 **State (git-verified, RELEASED):** v0.3.0 is **merged + tagged**. PR #1
 squash-merged to `main` as `def930c`; annotated tag **`v0.3.0`** pushed at

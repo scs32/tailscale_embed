@@ -30,7 +30,14 @@ echo "TailscaleEmbed.xcframework installed to ios/ (local build)"
 [ "${1:-}" = "--publish" ] || exit 0
 
 # ---- publish: zip, checksum, GitHub Release, pin ----------------------------
-TS_VERSION="$(grep -m1 'tailscale.com v' go.mod | awk '{print $2}' | sed 's/^v//')"
+# go list, not grep: go.mod's require formatting changes under `go mod tidy`
+# (block vs single-line), which once broke a field-based grep into publishing
+# a "framework-vtailscale.com" tag.
+TS_VERSION="$(go list -m -f '{{.Version}}' tailscale.com | sed 's/^v//')"
+case "$TS_VERSION" in
+  [0-9]*) ;;
+  *) echo "could not determine tailscale version (got '$TS_VERSION')" >&2; exit 1 ;;
+esac
 ZIP=TailscaleEmbed.xcframework.zip
 
 # One immutable release per build: never reuse a tag (old commits pin old

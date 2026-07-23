@@ -22,7 +22,11 @@ has been running in production on iOS since July 2026.
   `dart:io`, so `HttpOverrides` can't see them — wrap those in
   [`TailscaleClient`](#routing-native-http-clients) instead.
 - **`TailscaleGuard`** re-checks node + listener health on launch/foreground
-  (iOS reclaims sockets during suspension) behind a blocking overlay.
+  (iOS reclaims sockets during suspension) behind a blocking overlay. The
+  resume path also rebinds magicsock's UDP sockets (as the official iOS
+  client does on wake) — without it the node comes back with dead receive
+  loops (the "MagicSock function ReceiveIPv4 is not running" health
+  warning) and silently degrades to DERP relay.
 - MagicDNS names are resolved **on-device from the node's peer list** — the
   phone has no system MagicDNS, so the proxy does it itself. That includes
   bare **short names** (`truenas-ts`, not just
@@ -56,7 +60,7 @@ dependencies:
   tailscale_embed:
     git:
       url: https://github.com/scs32/tailscale_embed.git
-      ref: v0.3.0
+      ref: v0.3.1
 ```
 
 Pin a version tag rather than `main` or a commit hash: tags communicate

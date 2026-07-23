@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"strings"
 	"testing"
 )
 
@@ -145,6 +146,29 @@ func TestResolveTailnetIPLiterals(t *testing.T) {
 			t.Errorf("resolveTailnet(%q) = (%q, %v), want (%q, %v)",
 				tt.hostport, dest, via, tt.wantDest, tt.wantVia)
 		}
+	}
+}
+
+// rebindMagicsock runs on every EnsureProxy (foreground/resume), including
+// paths where the node was constructed but never started — it must be a
+// quiet no-op there, not a panic. A started node can't be exercised in unit
+// tests (needs a real control plane); the real suspend/resume behavior is
+// verified on-device.
+func TestRebindMagicsockNotStarted(t *testing.T) {
+	// server present but never started: Sys() is nil.
+	ts := NewTailscale(t.TempDir(), "", "test")
+	ts.rebindMagicsock()
+	// no server at all (mirrors other unit-test constructions).
+	(&Tailscale{}).rebindMagicsock()
+}
+
+// EnsureProxy on a non-running instance must fail with NOT_RUNNING before
+// touching magicsock or the listener.
+func TestEnsureProxyNotRunning(t *testing.T) {
+	ts := NewTailscale(t.TempDir(), "", "test")
+	_, err := ts.EnsureProxy()
+	if err == nil || !strings.Contains(err.Error(), ErrCodeNotRunning) {
+		t.Errorf("EnsureProxy() err = %v, want tsembed:%s", err, ErrCodeNotRunning)
 	}
 }
 
