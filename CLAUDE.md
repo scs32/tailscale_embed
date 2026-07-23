@@ -26,10 +26,14 @@ health-warning-clears-on-resume check needs a running node with a real auth
 key — NOT yet done (same blocker as the standing real-key e2e item); Tailarr
 can confirm via its Status page after bumping.
 
-**Released:** version 0.3.1 (pubspec + podspec), framework republished via
-`go/build.sh --publish` (new immutable `framework-v1.92.5-N` tag,
-Framework.lock updated), tag `v0.3.1`, README ref bumped. Tailarr bumps with
-`ref: v0.3.1`.
+**Released (git-verified on origin):** version 0.3.1 (pubspec + podspec),
+commit `38c814a` on main, annotated tag `v0.3.1` pushed. Framework
+republished as **`framework-v1.92.5-2`** (Framework.lock: SHA256
+`9b974294b4776fee20a8c1f7bc1fdd8f9a645af4f3701c39ab893031297fc9d8`; asset
+re-downloaded and checksum-verified against the lock). README ref bumped to
+`ref: v0.3.1`. A full bump-and-verify handoff prompt was written for the
+Tailarr session (includes the suspend/resume verification steps) — Tailarr's
+real-device run is the closing verification; awaiting their report.
 
 **build.sh gotcha (fixed this session):** the publish step's TS_VERSION grep
 (`awk '{print $2}'` on the go.mod require line) broke when `go mod tidy`
