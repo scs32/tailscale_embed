@@ -26,7 +26,12 @@ has been running in production on iOS since July 2026.
   resume path also rebinds magicsock's UDP sockets (as the official iOS
   client does on wake) — without it the node comes back with dead receive
   loops (the "MagicSock function ReceiveIPv4 is not running" health
-  warning) and silently degrades to DERP relay.
+  warning) and silently degrades to DERP relay. A built-in **watchdog**
+  backstops this: whenever a status read shows that warning, the node
+  self-heals — a magicsock rebind first, escalating to a **full in-place
+  node restart** if the warning persists (a rebind cannot revive an exited
+  receive goroutine; only a restart respawns it). The restart happens behind
+  the same proxy port, so apps never notice.
 - MagicDNS names are resolved **on-device from the node's peer list** — the
   phone has no system MagicDNS, so the proxy does it itself. That includes
   bare **short names** (`truenas-ts`, not just
@@ -60,7 +65,7 @@ dependencies:
   tailscale_embed:
     git:
       url: https://github.com/scs32/tailscale_embed.git
-      ref: v0.3.2
+      ref: v0.3.3
 ```
 
 Pin a version tag rather than `main` or a commit hash: tags communicate

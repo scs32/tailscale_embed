@@ -248,3 +248,93 @@ func TestStatusJSONIdentityNotRunning(t *testing.T) {
 		t.Errorf("StatusJSON() = (%q, %v), want identity \"work\"", got, err)
 	}
 }
+
+// The heal ladder: attempt 1 rebinds (cheap first aid), attempt 2+ escalates
+// to a full server restart — field evidence (v0.3.2 failure) and the
+// magicsock source agree a rebind cannot revive an exited receive goroutine,
+// so a warning that survives one rebind window demands the restart. Restarts
+// are additionally rate-limited; a healthy status resets the ladder.
+func TestMaybeSelfHealEscalation(t *testing.T) {
+	rebinds := make(chan string, 8)
+	restarts := make(chan string, 8)
+	ts := &Tailscale{
+		rebindFn:  func(r string) { rebinds <- r },
+		restartFn: func(r string) { restarts <- r },
+	}
+	sick := &ipnstate.Status{Health: []string{"The MagicSock function ReceiveIPv4 is not running."}}
+
+	expect := func(step string, ch chan string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s: expected heal action did not fire", step)
+		}
+	}
+	expectQuiet := func(step string) {
+		t.Helper()
+		select {
+		case r := <-rebinds:
+			t.Fatalf("%s: unexpected rebind %q", step, r)
+		case r := <-restarts:
+			t.Fatalf("%s: unexpected restart %q", step, r)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	ts.maybeSelfHeal(sick) // attempt 1 → rebind
+	expect("attempt 1", rebinds)
+	expectQuiet("attempt 1 must not also restart")
+
+	ts.maybeSelfHeal(sick) // inside selfHealInterval → suppressed
+	expectQuiet("rate-limited")
+
+	ts.healMu.Lock()
+	ts.lastHeal = time.Now().Add(-selfHealInterval - time.Second)
+	ts.healMu.Unlock()
+	ts.maybeSelfHeal(sick) // attempt 2 → escalate to restart
+	expect("attempt 2", restarts)
+	expectQuiet("attempt 2 must not also rebind")
+
+	ts.healMu.Lock()
+	ts.lastHeal = time.Now().Add(-selfHealInterval - time.Second)
+	ts.healMu.Unlock()
+	ts.maybeSelfHeal(sick) // attempt 3, restart rate-limited → rebind again
+	expect("attempt 3 falls back to rebind", rebinds)
+
+	ts.healMu.Lock()
+	ts.lastHeal = time.Now().Add(-selfHealInterval - time.Second)
+	ts.lastRestart = time.Now().Add(-selfHealRestartInterval - time.Second)
+	ts.healMu.Unlock()
+	ts.maybeSelfHeal(sick) // restart window reopened → restart
+	expect("attempt 4 restarts again", restarts)
+
+	ts.maybeSelfHeal(&ipnstate.Status{}) // healthy → ladder resets
+	ts.healMu.Lock()
+	if ts.healAttempts != 0 {
+		t.Errorf("healthy status should reset healAttempts, got %d", ts.healAttempts)
+	}
+	ts.lastHeal = time.Now().Add(-selfHealInterval - time.Second)
+	ts.healMu.Unlock()
+	ts.maybeSelfHeal(sick) // fresh episode → back to rebind
+	expect("fresh episode restarts the ladder at rebind", rebinds)
+}
+
+// restartServer must be a quiet no-op when the node isn't running (watchdog
+// racing a StopProxy), and safe on a zero-value instance.
+func TestRestartServerNotRunning(t *testing.T) {
+	ts := NewTailscale(t.TempDir(), "", "test-host")
+	ts.restartServer("test")
+	(&Tailscale{}).restartServer("test")
+}
+
+// newServer must carry the retained config so the watchdog's rebuilt server
+// is identical to the original (same state dir → same node identity).
+func TestNewServerCarriesConfig(t *testing.T) {
+	ts := NewTailscale("/tmp/x", "tskey-auth-test", "host-a")
+	ts.SetEphemeral(true)
+	s := ts.newServer()
+	if s.Dir != "/tmp/x" || s.Hostname != "host-a" || s.AuthKey != "tskey-auth-test" || !s.Ephemeral {
+		t.Errorf("newServer dropped config: %+v", s)
+	}
+}

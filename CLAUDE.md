@@ -1,6 +1,71 @@
 # tailscale_embed — session notes
 
-## Magicsock path-change rebind session (2026-07-23 evening, latest): v0.3.2
+## Watchdog restart-escalation session (2026-07-24, latest): v0.3.3
+
+**v0.3.2 FAILED closing verification** — third field sighting
+(`~/projects/magicsock-receiveipv4-v032-build15.jpg`): real device on
+v0.3.2/framework-v1.92.5-3, warning persisted across 30+ seconds of status
+refreshes, so all three v0.3.2 layers demonstrably fired and Rebind()+ReSTUN()
+still didn't clear it. Source investigation of tailscale v1.92.5 (module
+cache) proved WHY, with citations:
+
+- The warning only fires when wireguard-go's receive goroutine has
+  **permanently exited**: `health.checkReceiveFuncsLocked()`
+  (health/health.go:1350) marks a func "missing" only if it made zero calls
+  in ~60s AND isn't blocked mid-call — a live-but-stuck goroutine reads
+  healthy. So warning ⇒ goroutine dead.
+- wireguard-go `RoutineReceiveIncoming` (device/receive.go:112-124) exits on
+  `net.ErrClosed` or persistent non-temporary errors — which iOS socket
+  teardown produces.
+- `magicsock.Conn.Rebind()` (magicsock.go:3614) only swaps the pconn inside
+  `RebindingUDPConn` — under a loop that no longer runs. **Nothing respawns
+  the goroutine except `device.BindUpdate()`** (bind close+open), reachable
+  only via device Down/Up — NOT exposed by tsnet/wgengine/localapi. No
+  middle path exists; minimal reliable recovery = full server Close + new
+  Server. Matches the only field-observed recovery (stop/start).
+
+**Fix (v0.3.3, Go-only, no Dart/Swift changes):** the watchdog now
+**escalates**. `maybeSelfHeal` heal ladder: attempt 1 → rebind (unchanged);
+attempt 2+ (warning survived ≥30s past a rebind) → `restartServer()`: close
+the tsnet server, build a fresh one on the same state dir (`newServer()` from
+retained hostname/authKey/ephemeral), `Up()` (keep the server even if Up
+times out — Up only watches an already-Started backend; it converges when the
+network allows), re-apply RouteAll. **Proxy listener/port untouched** —
+consumers never see the restart; while the node is down status() errors so
+proxied dials fall back to direct, keeping public traffic flowing. Restarts
+rate-limited by `selfHealRestartInterval` (2min) on top of the 30s heal
+interval; healthy status resets the ladder. Server pointer swap guarded by
+`srvMu` (dial/status/rebind read via `t.srv()`); StopProxy race handled (a
+restart landing after StopProxy closes the new server instead of resurrecting
+the node). Test seams `rebindFn`/`restartFn`.
+
+**Verified:** `go vet` + `go test -race` green (+3 tests: escalation ladder,
+restartServer not-running/zero-value safety, newServer config carry),
+`flutter analyze` clean, `flutter test` 24/24, example `flutter build ios
+--simulator` links the rebuilt framework. Published asset re-downloaded and
+SHA256-verified against Framework.lock.
+
+**Released:** version 0.3.3 (pubspec + podspec), tag `v0.3.3`, framework
+**`framework-v1.92.5-4`** (Framework.lock SHA256
+`2fdb6e41232a647ada30bd1edd67017ec4a793d0f35190ca67d350efb2796b03`). README
+ref bumped to `ref: v0.3.3`; README now documents the watchdog escalation.
+
+**Closing verification (real device, only valid test for this class):**
+Tailarr bumps to v0.3.3 + framework-v1.92.5-4, reproduces (hours of uptime,
+WiFi↔cellular transition, warning appears), then keeps the Status page open:
+attempt 1 rebind at first status read, attempt 2 full restart ≥30s later —
+warning should clear within ~60-90s of first surfacing. Watch for the node
+briefly restarting (peers drop/reappear) — expected, once.
+
+### Next session, in order
+1. Relay v0.3.3 to Tailarr (bump + soak per closing verification above).
+   Supersedes the v0.3.2 roam check.
+2. Real-key end-to-end (unchanged, needs user's fresh `tskey-auth-…` × 2).
+   Sim `ts-browser-test` (9540842C-9F8C-4482-B159-85E4B2BC967C) still exists.
+3. Follow up on Plezy adoption of v0.3.0 reply (not yet confirmed landed).
+4. Gap 5 ("Android + TV input", incl. QR/pairing auth) — top roadmap item.
+
+## Magicsock path-change rebind session (2026-07-23 evening): v0.3.2
 
 **v0.3.1's resume rebind FAILED real-device verification** — the ReceiveIPv4
 warning recurred twice on 2026-07-23 (screenshots in

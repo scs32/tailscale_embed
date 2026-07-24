@@ -61,11 +61,16 @@ func classifyUpError(err error) string {
 // Status() must not be an IPC round-trip each time.
 const statusCacheTTL = 3 * time.Second
 
-// selfHealInterval rate-limits watchdog-triggered magicsock rebinds. A rebind
+// selfHealInterval rate-limits watchdog-triggered heal attempts. A heal
 // that fixes the receive path clears the health warning within one status
 // refresh; one that doesn't shouldn't be retried in a tight loop on every
 // proxied dial.
 const selfHealInterval = 30 * time.Second
+
+// selfHealRestartInterval rate-limits the watchdog's escalation to a full
+// tsnet server restart. A restart that worked clears the warning well within
+// this window; one that didn't shouldn't restart-loop the node.
+const selfHealRestartInterval = 2 * time.Minute
 
 // Tailscale wraps tsnet.Server and provides an HTTP proxy for routing traffic.
 type Tailscale struct {
@@ -82,12 +87,28 @@ type Tailscale struct {
 	upTimeout    time.Duration
 	acceptRoutes bool
 
+	// Retained so the watchdog can rebuild the tsnet.Server from scratch —
+	// a dead magicsock receive goroutine is only respawned by a full
+	// device bind cycle, which tsnet exposes solely as Close + new server.
+	hostname  string
+	authKey   string
+	ephemeral bool
+
 	stMu sync.Mutex
 	st   *ipnstate.Status
 	stAt time.Time
 
-	healMu   sync.Mutex
-	lastHeal time.Time
+	healMu       sync.Mutex
+	lastHeal     time.Time
+	lastRestart  time.Time
+	healAttempts int
+
+	restartMu sync.Mutex   // serializes watchdog restarts
+	srvMu     sync.RWMutex // guards the server pointer against a mid-dial swap
+
+	// Test seams; nil means the real rebindMagicsock / restartServer.
+	rebindFn  func(reason string)
+	restartFn func(reason string)
 }
 
 // NewTailscale creates a new Tailscale instance with the given state
@@ -100,25 +121,53 @@ func NewTailscale(stateDir, authKey, hostname string) *Tailscale {
 	os.Setenv("HOME", stateDir)
 	os.Setenv("TS_LOGS_DIR", stateDir)
 
-	return &Tailscale{
+	t := &Tailscale{
 		stateDir:     stateDir,
 		upTimeout:    45 * time.Second,
 		acceptRoutes: true,
-		server: &tsnet.Server{
-			Dir:       stateDir,
-			Hostname:  hostname,
-			AuthKey:   authKey,
-			Ephemeral: false,
-			Logf: func(format string, args ...any) {
-				log.Printf("[tsnet] "+format, args...)
-			},
+		hostname:     hostname,
+		authKey:      authKey,
+	}
+	t.server = t.newServer()
+	return t
+}
+
+// newServer builds a tsnet.Server from the retained config. Used at
+// construction and by the watchdog's full restart (a fresh Server is the only
+// public path to a wireguard bind cycle; a Closed one can't be reused).
+func (t *Tailscale) newServer() *tsnet.Server {
+	return &tsnet.Server{
+		Dir:       t.stateDir,
+		Hostname:  t.hostname,
+		AuthKey:   t.authKey,
+		Ephemeral: t.ephemeral,
+		Logf: func(format string, args ...any) {
+			log.Printf("[tsnet] "+format, args...)
 		},
 	}
+}
+
+// srv returns the current tsnet server. The watchdog's full restart swaps
+// the pointer while dials and status reads are in flight; they must see
+// either the old (closed, errors cleanly) or the new server, never a torn
+// read.
+func (t *Tailscale) srv() *tsnet.Server {
+	t.srvMu.RLock()
+	defer t.srvMu.RUnlock()
+	return t.server
+}
+
+// setSrv swaps the server pointer. Callers hold t.mu.
+func (t *Tailscale) setSrv(s *tsnet.Server) {
+	t.srvMu.Lock()
+	t.server = s
+	t.srvMu.Unlock()
 }
 
 // SetEphemeral marks the node ephemeral (deregisters when it disconnects).
 // Call before StartProxy.
 func (t *Tailscale) SetEphemeral(v bool) {
+	t.ephemeral = v
 	t.server.Ephemeral = v
 }
 
@@ -171,15 +220,7 @@ func (t *Tailscale) StartProxy() (int, error) {
 	// embedded netstack routes peer-advertised subnets. This only affects
 	// the in-app node — no OS routing tables are touched.
 	if t.acceptRoutes {
-		if lc, err := t.server.LocalClient(); err == nil {
-			_, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
-				Prefs:       ipn.Prefs{RouteAll: true},
-				RouteAllSet: true,
-			})
-			if err != nil {
-				log.Printf("[tsnet] enabling accept-routes failed: %v", err)
-			}
-		}
+		t.applyRouteAll(ctx, t.server)
 	}
 
 	// Create listener on random port
@@ -290,10 +331,11 @@ func (t *Tailscale) RebindNetwork() {
 // of serving the pre-rebind warning. Safe to call on an instance that never
 // started (tsnet populates Sys() only during start).
 func (t *Tailscale) rebindMagicsock(reason string) {
-	if t.server == nil {
+	s := t.srv()
+	if s == nil {
 		return
 	}
-	sys := t.server.Sys()
+	sys := s.Sys()
 	if sys == nil {
 		return
 	}
@@ -322,16 +364,101 @@ func healthNeedsRebind(health []string) bool {
 	return false
 }
 
-// maybeSelfHeal is the watchdog half of the rebind story: whenever a freshly
-// fetched status carries the dead-receive-path warning, rebind (rate-limited
-// by selfHealInterval). Recovery is thereby observable-state-driven, catching
-// whatever the resume hook and the native path monitor miss — status() runs
-// on every proxied dial and every StatusJSON, so a degraded node heals as
-// soon as anything looks at it. The rebind runs async: status() backs dials
-// and must not block on socket churn (and it still holds stMu, which
-// rebindMagicsock takes to drop the cache).
+// applyRouteAll enables accept-routes on a running server (see StartProxy).
+func (t *Tailscale) applyRouteAll(ctx context.Context, s *tsnet.Server) {
+	lc, err := s.LocalClient()
+	if err != nil {
+		return
+	}
+	if _, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+		Prefs:       ipn.Prefs{RouteAll: true},
+		RouteAllSet: true,
+	}); err != nil {
+		log.Printf("[tsnet] enabling accept-routes failed: %v", err)
+	}
+}
+
+// restartServer tears down the tsnet server and builds a fresh one on the
+// same state directory. This is the watchdog's escalation: the "MagicSock
+// function ReceiveIPv4 is not running" warning means wireguard-go's receive
+// goroutine has permanently exited (health only flags a func with zero calls
+// that isn't blocked mid-call), and nothing short of a full wireguard bind
+// cycle respawns it — Rebind() merely swaps the socket under a loop that is
+// no longer running (tailscale#10976 class). tsnet exposes that cycle only
+// as Close + new Server. The proxy listener and port are untouched, so
+// consumers never observe the restart; while the node is down, status()
+// errors and proxied dials fall back to the direct path, so non-tailnet
+// traffic keeps flowing.
+func (t *Tailscale) restartServer(reason string) {
+	if !t.restartMu.TryLock() {
+		return // a restart is already in flight
+	}
+	defer t.restartMu.Unlock()
+
+	t.mu.Lock()
+	if !t.running {
+		t.mu.Unlock()
+		return
+	}
+	old := t.server
+	t.mu.Unlock()
+
+	log.Printf("[tsnet] restarting node (%s)", reason)
+	old.Close()
+
+	ns := t.newServer()
+	ctx, cancel := context.WithTimeout(context.Background(), t.upTimeout)
+	defer cancel()
+	if _, err := ns.Up(ctx); err != nil {
+		// Up only watches an already-Started backend: on error the server
+		// keeps running and converges once the network allows. Keep it —
+		// the old server's receive path is dead either way, so there is
+		// nothing better to fall back to.
+		log.Printf("[tsnet] restart (%s): Up not confirmed: %v (keeping server; it will converge)", reason, err)
+	} else if t.acceptRoutes {
+		t.applyRouteAll(ctx, ns)
+	}
+
+	t.mu.Lock()
+	if !t.running {
+		// StopProxy ran while we were coming up; don't resurrect the node.
+		t.mu.Unlock()
+		ns.Close()
+		return
+	}
+	t.setSrv(ns)
+	t.mu.Unlock()
+
+	t.stMu.Lock()
+	t.st = nil
+	t.stMu.Unlock()
+	log.Printf("[tsnet] node restarted (%s)", reason)
+}
+
+// maybeSelfHeal is the watchdog half of the recovery story: whenever a
+// freshly fetched status carries the dead-receive-path warning, heal
+// (rate-limited by selfHealInterval). Recovery is thereby observable-state-
+// driven, catching whatever the resume hook and the native path monitor miss
+// — status() runs on every proxied dial and every StatusJSON, so a degraded
+// node heals as soon as anything looks at it.
+//
+// Healing escalates: the first attempt is a cheap magicsock rebind; if the
+// warning survives into a second attempt (≥selfHealInterval later, i.e. the
+// rebind demonstrably didn't fix it — field evidence and source both say it
+// can't once the receive goroutine has exited), do the full server restart,
+// the only recovery ever observed to clear this state. Restarts are further
+// rate-limited by selfHealRestartInterval. A healthy status resets the
+// ladder. Heals run async: status() backs dials and must not block on
+// socket churn (and it still holds stMu, which both heal paths take to drop
+// the cache).
 func (t *Tailscale) maybeSelfHeal(st *ipnstate.Status) {
-	if st == nil || !healthNeedsRebind(st.Health) {
+	if st == nil {
+		return
+	}
+	if !healthNeedsRebind(st.Health) {
+		t.healMu.Lock()
+		t.healAttempts = 0
+		t.healMu.Unlock()
 		return
 	}
 	t.healMu.Lock()
@@ -340,9 +467,28 @@ func (t *Tailscale) maybeSelfHeal(st *ipnstate.Status) {
 		return
 	}
 	t.lastHeal = time.Now()
+	t.healAttempts++
+	attempt := t.healAttempts
+	escalate := attempt >= 2 && time.Since(t.lastRestart) >= selfHealRestartInterval
+	if escalate {
+		t.lastRestart = time.Now()
+	}
+	rebind, restart := t.rebindFn, t.restartFn
 	t.healMu.Unlock()
-	log.Printf("[tsnet] health reports dead magicsock receive path; self-healing")
-	go t.rebindMagicsock("tsembed-selfheal")
+
+	if rebind == nil {
+		rebind = t.rebindMagicsock
+	}
+	if restart == nil {
+		restart = t.restartServer
+	}
+	if escalate {
+		log.Printf("[tsnet] magicsock receive path still dead after rebind (attempt %d); escalating to full node restart", attempt)
+		go restart("tsembed-selfheal-restart")
+	} else {
+		log.Printf("[tsnet] health reports dead magicsock receive path; self-healing (attempt %d)", attempt)
+		go rebind("tsembed-selfheal")
+	}
 }
 
 // StopProxy stops the HTTP proxy and tsnet server.
@@ -500,7 +646,7 @@ func (t *Tailscale) status(ctx context.Context) (*ipnstate.Status, error) {
 	if t.st != nil && time.Since(t.stAt) < statusCacheTTL {
 		return t.st, nil
 	}
-	lc, err := t.server.LocalClient()
+	lc, err := t.srv().LocalClient()
 	if err != nil {
 		return nil, err
 	}
@@ -622,7 +768,7 @@ func (t *Tailscale) resolveTailnet(ctx context.Context, hostport string) (string
 func (t *Tailscale) dial(ctx context.Context, network, hostport string) (net.Conn, error) {
 	dest, viaTailnet := t.resolveTailnet(ctx, hostport)
 	if viaTailnet {
-		return t.server.Dial(ctx, network, dest)
+		return t.srv().Dial(ctx, network, dest)
 	}
 	var d net.Dialer
 	return d.DialContext(ctx, network, dest)
