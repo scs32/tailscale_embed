@@ -61,6 +61,12 @@ func classifyUpError(err error) string {
 // Status() must not be an IPC round-trip each time.
 const statusCacheTTL = 3 * time.Second
 
+// selfHealInterval rate-limits watchdog-triggered magicsock rebinds. A rebind
+// that fixes the receive path clears the health warning within one status
+// refresh; one that doesn't shouldn't be retried in a tight loop on every
+// proxied dial.
+const selfHealInterval = 30 * time.Second
+
 // Tailscale wraps tsnet.Server and provides an HTTP proxy for routing traffic.
 type Tailscale struct {
 	server    *tsnet.Server
@@ -79,6 +85,9 @@ type Tailscale struct {
 	stMu sync.Mutex
 	st   *ipnstate.Status
 	stAt time.Time
+
+	healMu   sync.Mutex
+	lastHeal time.Time
 }
 
 // NewTailscale creates a new Tailscale instance with the given state
@@ -233,7 +242,7 @@ func (t *Tailscale) EnsureProxy() (int, error) {
 	// loops ("the MagicSock function ReceiveIPv4 is not running" health
 	// warning) and silently fall back to DERP relay. Rebind unconditionally,
 	// as the official iOS client does on wake.
-	t.rebindMagicsock()
+	t.rebindMagicsock("tsembed-resume")
 
 	// Health check: can we reach our own listener?
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", t.proxyPort), 2*time.Second)
@@ -261,12 +270,26 @@ func (t *Tailscale) EnsureProxy() (int, error) {
 	return t.proxyPort, nil
 }
 
+// RebindNetwork re-binds magicsock's UDP sockets and re-runs STUN discovery.
+// The native layer calls this on every network path change (NWPathMonitor):
+// iOS invalidates UDP sockets on WiFi↔cellular handoffs and radio power
+// transitions that can happen while the app is foregrounded, where no resume
+// event — and thus no EnsureProxy — ever fires. The official iOS client
+// pairs its wake rebind with exactly this path-change rebind. Quiet no-op
+// when the node isn't running.
+func (t *Tailscale) RebindNetwork() {
+	if !t.IsRunning() {
+		return
+	}
+	t.rebindMagicsock("tsembed-pathchange")
+}
+
 // rebindMagicsock closes and re-binds magicsock's UDP sockets and re-runs
 // STUN endpoint discovery (Rebind's doc requires the follow-up ReSTUN). It
 // then drops the cached status so the next StatusJSON re-reads health instead
 // of serving the pre-rebind warning. Safe to call on an instance that never
 // started (tsnet populates Sys() only during start).
-func (t *Tailscale) rebindMagicsock() {
+func (t *Tailscale) rebindMagicsock(reason string) {
 	if t.server == nil {
 		return
 	}
@@ -279,11 +302,47 @@ func (t *Tailscale) rebindMagicsock() {
 		return
 	}
 	ms.Rebind()
-	ms.ReSTUN("tsembed-resume")
+	ms.ReSTUN(reason)
 	t.stMu.Lock()
 	t.st = nil
 	t.stMu.Unlock()
-	log.Printf("[tsnet] magicsock rebound (resume)")
+	log.Printf("[tsnet] magicsock rebound (%s)", reason)
+}
+
+// healthNeedsRebind reports whether any health warning says magicsock's
+// receive paths are down ("the MagicSock function ReceiveIPv4 is not
+// running", tailscale#10976 class) — the state a rebind fixes.
+func healthNeedsRebind(health []string) bool {
+	for _, w := range health {
+		lw := strings.ToLower(w)
+		if strings.Contains(lw, "magicsock") && strings.Contains(lw, "not running") {
+			return true
+		}
+	}
+	return false
+}
+
+// maybeSelfHeal is the watchdog half of the rebind story: whenever a freshly
+// fetched status carries the dead-receive-path warning, rebind (rate-limited
+// by selfHealInterval). Recovery is thereby observable-state-driven, catching
+// whatever the resume hook and the native path monitor miss — status() runs
+// on every proxied dial and every StatusJSON, so a degraded node heals as
+// soon as anything looks at it. The rebind runs async: status() backs dials
+// and must not block on socket churn (and it still holds stMu, which
+// rebindMagicsock takes to drop the cache).
+func (t *Tailscale) maybeSelfHeal(st *ipnstate.Status) {
+	if st == nil || !healthNeedsRebind(st.Health) {
+		return
+	}
+	t.healMu.Lock()
+	if time.Since(t.lastHeal) < selfHealInterval {
+		t.healMu.Unlock()
+		return
+	}
+	t.lastHeal = time.Now()
+	t.healMu.Unlock()
+	log.Printf("[tsnet] health reports dead magicsock receive path; self-healing")
+	go t.rebindMagicsock("tsembed-selfheal")
 }
 
 // StopProxy stops the HTTP proxy and tsnet server.
@@ -450,6 +509,7 @@ func (t *Tailscale) status(ctx context.Context) (*ipnstate.Status, error) {
 		return nil, err
 	}
 	t.st, t.stAt = st, time.Now()
+	t.maybeSelfHeal(st)
 	return st, nil
 }
 

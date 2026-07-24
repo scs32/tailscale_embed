@@ -1,6 +1,64 @@
 # tailscale_embed — session notes
 
-## Magicsock resume-rebind session (2026-07-23, latest): v0.3.1
+## Magicsock path-change rebind session (2026-07-23 evening, latest): v0.3.2
+
+**v0.3.1's resume rebind FAILED real-device verification** — the ReceiveIPv4
+warning recurred twice on 2026-07-23 (screenshots in
+`~/projects/magicsock-receiveipv4-*.jpg`): morning on WiFi (~3.6h uptime,
+pre-fix build) and afternoon on **mobile data** with TestFlight build 14
+running v0.3.1/framework-v1.92.5-2 (CI-confirmed). Root cause of the miss:
+the v0.3.1 rebind only runs from `EnsureProxy()` (app resume), but iOS also
+invalidates UDP sockets on **network path changes** — WiFi↔cellular handoff,
+band changes, radio power management — which happen while foregrounded, with
+no resume event. tsnet's built-in netmon doesn't catch these in the gomobile
+sandbox. The official iOS client pairs the wake rebind with an
+NWPathMonitor-driven rebind; we now do the same, in three layers:
+
+1. **Go `RebindNetwork()`** (exported): no-op unless running, calls
+   `rebindMagicsock(reason)` (now takes a reason string:
+   tsembed-resume / tsembed-pathchange / tsembed-selfheal).
+2. **Swift NWPathMonitor** (`startPathMonitorIfNeeded()`): started lazily on
+   first successful start (incl. rollback path), kept for plugin lifetime
+   (NWPathMonitor can't restart after cancel; isRunning guard makes it inert
+   when stopped). Path signature = status + interface type:name list; first
+   callback records the baseline only; rebind runs off-main after
+   snapshotting the instance on main.
+3. **Go self-heal watchdog** (`maybeSelfHeal`, called from `status()` on
+   every FRESH fetch — i.e. every proxied dial / StatusJSON past the 3s
+   cache): if health contains the magicsock "not running" warning
+   (`healthNeedsRebind`, case-insensitive), rebind async, rate-limited to
+   one per 30s (`selfHealInterval`). Observable-state-driven — catches
+   whatever the resume hook and path monitor miss.
+
+The v0.3.1 resume rebind is kept (correct, just not sufficient).
+
+**Verified:** `go test` green (+3 tests: RebindNetwork nil-safety,
+healthNeedsRebind matrix, maybeSelfHeal rate limit), `flutter analyze`
+clean, `flutter test` 24/24, example `flutter build ios --simulator` links
+the rebuilt framework (proves the new gomobile symbol resolves from Swift).
+
+**Released:** version 0.3.2 (pubspec + podspec), tag `v0.3.2`, framework
+**`framework-v1.92.5-3`** (Framework.lock SHA256
+`6e7c5d9f1d66c2e47ebfa2a10d10cb642c60325fb98879051ab9bdc8f3e9655c`, asset
+re-downloaded + checksum-verified). README ref bumped to `ref: v0.3.2`.
+
+**Closing verification (still open, and unit/sim CANNOT catch this class):**
+both failures were long-uptime real-device runs with radio transitions. The
+real test: phone foregrounded, roam WiFi↔cellular (toggle WiFi off/on works),
+then check Tailarr's Settings > General > Network > Tailscale Status — the
+warning should clear within ~30s even if the path monitor misses (watchdog
+fires on the status page's own reads). Needs Tailarr to bump to v0.3.2 +
+framework-v1.92.5-3 and a TestFlight soak.
+
+### Next session, in order
+1. Relay v0.3.2 to Tailarr (bump + real-device roam/soak verification per
+   above). This supersedes the v0.3.1 suspend/resume check.
+2. Real-key end-to-end (unchanged, needs user's fresh `tskey-auth-…` × 2).
+   Sim `ts-browser-test` (9540842C-9F8C-4482-B159-85E4B2BC967C) still exists.
+3. Follow up on Plezy adoption of v0.3.0 reply (not yet confirmed landed).
+4. Gap 5 ("Android + TV input", incl. QR/pairing auth) — top roadmap item.
+
+## Magicsock resume-rebind session (2026-07-23 morning): v0.3.1
 
 **Bug (Tailarr, confirmed twice on real devices):** after iOS suspend/resume
 the node reported the health warning "The MagicSock function ReceiveIPv4 is

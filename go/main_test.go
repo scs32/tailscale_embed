@@ -7,6 +7,9 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
+
+	"tailscale.com/ipn/ipnstate"
 )
 
 func TestIsTailnetIP(t *testing.T) {
@@ -157,9 +160,68 @@ func TestResolveTailnetIPLiterals(t *testing.T) {
 func TestRebindMagicsockNotStarted(t *testing.T) {
 	// server present but never started: Sys() is nil.
 	ts := NewTailscale(t.TempDir(), "", "test")
-	ts.rebindMagicsock()
+	ts.rebindMagicsock("test")
 	// no server at all (mirrors other unit-test constructions).
-	(&Tailscale{}).rebindMagicsock()
+	(&Tailscale{}).rebindMagicsock("test")
+}
+
+// RebindNetwork is driven by the native path monitor, which can fire at any
+// point in the node's lifecycle — before start, after stop. It must be a
+// quiet no-op on a non-running instance.
+func TestRebindNetworkNotRunning(t *testing.T) {
+	NewTailscale(t.TempDir(), "", "test").RebindNetwork()
+	(&Tailscale{}).RebindNetwork()
+}
+
+func TestHealthNeedsRebind(t *testing.T) {
+	tests := []struct {
+		health []string
+		want   bool
+	}{
+		{nil, false},
+		{[]string{}, false},
+		{[]string{"The MagicSock function ReceiveIPv4 is not running"}, true},
+		{[]string{"The MagicSock function ReceiveIPv6 is not running"}, true},
+		{[]string{"the magicsock function receiveipv4 is not running"}, true}, // case-insensitive
+		{[]string{"router: some unrelated warning"}, false},
+		{[]string{"not running"}, false}, // needs the magicsock half too
+		{[]string{"unrelated", "The MagicSock function ReceiveIPv4 is not running"}, true},
+	}
+	for _, tt := range tests {
+		if got := healthNeedsRebind(tt.health); got != tt.want {
+			t.Errorf("healthNeedsRebind(%q) = %v, want %v", tt.health, got, tt.want)
+		}
+	}
+}
+
+// The watchdog must rate-limit: a warning that survives a rebind reappears in
+// every fresh status (which backs every proxied dial), and that must not
+// become a rebind storm.
+func TestMaybeSelfHealRateLimit(t *testing.T) {
+	ts := &Tailscale{} // no server: rebindMagicsock is a no-op, timing still recorded
+	st := &ipnstate.Status{Health: []string{"The MagicSock function ReceiveIPv4 is not running"}}
+
+	ts.maybeSelfHeal(st)
+	first := ts.lastHeal
+	if first.IsZero() {
+		t.Fatal("first maybeSelfHeal should record a heal attempt")
+	}
+	ts.maybeSelfHeal(st)
+	if ts.lastHeal != first {
+		t.Error("second maybeSelfHeal within selfHealInterval should be suppressed")
+	}
+	ts.lastHeal = time.Now().Add(-selfHealInterval - time.Second)
+	ts.maybeSelfHeal(st)
+	if ts.lastHeal == first || ts.lastHeal.IsZero() {
+		t.Error("maybeSelfHeal after selfHealInterval should rebind again")
+	}
+
+	healthy := &Tailscale{}
+	healthy.maybeSelfHeal(&ipnstate.Status{})
+	if !healthy.lastHeal.IsZero() {
+		t.Error("maybeSelfHeal must not fire on a healthy status")
+	}
+	healthy.maybeSelfHeal(nil)
 }
 
 // EnsureProxy on a non-running instance must fail with NOT_RUNNING before

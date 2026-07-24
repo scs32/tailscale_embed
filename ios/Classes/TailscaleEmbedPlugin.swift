@@ -30,6 +30,21 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
     /// succeed even with a consumed key.
     private var lastGoodConfig: StartConfig?
 
+    /// Rebinds magicsock on every network path change. iOS invalidates UDP
+    /// sockets on WiFi↔cellular handoffs and radio power transitions that
+    /// can happen while the app is foregrounded — no resume event fires
+    /// there, so the EnsureProxy wake rebind never runs. This mirrors the
+    /// official iOS client, which pairs its wake rebind with an
+    /// NWPathMonitor-driven one. Started lazily at the first successful
+    /// start and kept for the plugin's lifetime (NWPathMonitor cannot be
+    /// restarted after cancel); the isRunning guard makes it inert while
+    /// the node is stopped.
+    private var pathMonitor: NWPathMonitor?
+    private let pathMonitorQueue = DispatchQueue(
+        label: "com.tailarr.tailscale_embed.path-monitor")
+    /// Last seen path signature, touched only on pathMonitorQueue.
+    private var lastPathSignature: String?
+
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(
             name: "com.tailarr.tailscale_embed/method",
@@ -82,6 +97,38 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
             return FlutterError(code: code, message: detail, details: nil)
         }
         return FlutterError(code: fallbackCode, message: msg, details: nil)
+    }
+
+    private func startPathMonitorIfNeeded() {
+        guard pathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            // Interface names distinguish real transitions (en0→pdp_ip0)
+            // that a status-only signature would miss.
+            let signature = path.status == .satisfied
+                ? "up|" + path.availableInterfaces
+                    .map { "\($0.type):\($0.name)" }
+                    .joined(separator: ",")
+                : "down"
+            // The first callback reports the current path, not a change —
+            // record the baseline and only rebind on real transitions.
+            let changed = self.lastPathSignature != nil
+                && self.lastPathSignature != signature
+            self.lastPathSignature = signature
+            guard changed else { return }
+            // Snapshot the instance on the main thread (where it's
+            // mutated), then rebind off it — Rebind churns sockets and
+            // ReSTUN does network work.
+            DispatchQueue.main.async {
+                guard let instance = self.tailscale, instance.isRunning() else { return }
+                DispatchQueue.global(qos: .utility).async {
+                    instance.rebindNetwork()
+                }
+            }
+        }
+        monitor.start(queue: pathMonitorQueue)
+        pathMonitor = monitor
     }
 
     private func makeInstance(stateDir: String, config: StartConfig) -> TsembedTailscale? {
@@ -151,6 +198,7 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
                     self.proxyPort = port
                     self.activeIdentity = config.identity
                     self.lastGoodConfig = config
+                    self.startPathMonitorIfNeeded()
                     result(port)
                 }
             } catch {
@@ -172,6 +220,7 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
                             self.tailscale = fallback
                             self.proxyPort = port
                             self.activeIdentity = lastGood.identity
+                            self.startPathMonitorIfNeeded()
                         }
                     }
                 }
