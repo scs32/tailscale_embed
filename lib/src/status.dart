@@ -30,6 +30,10 @@ class TailscaleStatus {
   /// All peers visible to this node.
   final List<TailscaleNode> peers;
 
+  /// Self-heal telemetry for the "ReceiveIPv4 not running" recovery path.
+  /// Null when the node isn't running. Diagnostic — most apps can ignore it.
+  final TailscaleRecovery? recovery;
+
   const TailscaleStatus({
     required this.running,
     this.identity,
@@ -40,6 +44,7 @@ class TailscaleStatus {
     this.magicDnsSuffix,
     this.self,
     this.peers = const [],
+    this.recovery,
   });
 
   bool get isHealthy => running && backendState == 'Running' && health.isEmpty;
@@ -62,6 +67,69 @@ class TailscaleStatus {
               ?.map((p) => TailscaleNode.fromJson((p as Map).cast()))
               .toList() ??
           const [],
+      recovery: json['recovery'] != null
+          ? TailscaleRecovery.fromJson((json['recovery'] as Map).cast())
+          : null,
+    );
+  }
+}
+
+/// Self-heal telemetry for the magicsock "ReceiveIPv4 not running" warning.
+///
+/// The dead-receive-path state only reproduces on real devices (iOS parks UDP
+/// sockets on suspend/roam), so these counters exist to *attribute* a field
+/// occurrence: when the warning clears, they say whether a magicsock rebind
+/// and/or a full in-place node restart actually fired, and when. Timestamps are
+/// UTC RFC 3339 strings; counts are cumulative over the current node's lifetime.
+class TailscaleRecovery {
+  /// Whether the health snapshot at read time still carries the dead-receive
+  /// warning (the watchdog's trigger condition).
+  final bool needsRebind;
+
+  /// How many self-heal attempts the watchdog has made this episode (resets to
+  /// 0 on a healthy read).
+  final int healAttempts;
+
+  /// Total magicsock rebinds performed (resume + path-change + self-heal).
+  final int rebinds;
+
+  /// UTC RFC 3339 timestamp of the last rebind, or null if none.
+  final String? lastRebindAt;
+
+  /// Reason string of the last rebind (`tsembed-resume`, `tsembed-pathchange`,
+  /// `tsembed-selfheal`), or null.
+  final String? lastRebindReason;
+
+  /// Total full node restarts the watchdog has performed.
+  final int restarts;
+
+  /// UTC RFC 3339 timestamp of the last restart, or null if none.
+  final String? lastRestartAt;
+
+  /// Reason string of the last restart, or null.
+  final String? lastRestartReason;
+
+  const TailscaleRecovery({
+    this.needsRebind = false,
+    this.healAttempts = 0,
+    this.rebinds = 0,
+    this.lastRebindAt,
+    this.lastRebindReason,
+    this.restarts = 0,
+    this.lastRestartAt,
+    this.lastRestartReason,
+  });
+
+  factory TailscaleRecovery.fromJson(Map<String, dynamic> json) {
+    return TailscaleRecovery(
+      needsRebind: json['needsRebind'] as bool? ?? false,
+      healAttempts: json['healAttempts'] as int? ?? 0,
+      rebinds: json['rebinds'] as int? ?? 0,
+      lastRebindAt: json['lastRebindAt'] as String?,
+      lastRebindReason: json['lastRebindReason'] as String?,
+      restarts: json['restarts'] as int? ?? 0,
+      lastRestartAt: json['lastRestartAt'] as String?,
+      lastRestartReason: json['lastRestartReason'] as String?,
     );
   }
 }

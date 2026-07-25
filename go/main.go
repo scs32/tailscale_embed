@@ -103,6 +103,19 @@ type Tailscale struct {
 	lastRestart  time.Time
 	healAttempts int
 
+	// Recovery telemetry, surfaced in StatusJSON. The dead-ReceiveIPv4 state
+	// only reproduces on real devices (unit/sim can't), so these counters are
+	// how a field occurrence is attributed: whether a rebind and/or a full
+	// restart actually fired, when, and why, at the moment the warning cleared.
+	// Guarded by telMu.
+	telMu             sync.Mutex
+	rebindCount       int
+	lastRebindAt      time.Time
+	lastRebindReason  string
+	restartCount      int
+	lastRestartAt     time.Time
+	lastRestartReason string
+
 	restartMu sync.Mutex   // serializes watchdog restarts
 	srvMu     sync.RWMutex // guards the server pointer against a mid-dial swap
 
@@ -345,10 +358,74 @@ func (t *Tailscale) rebindMagicsock(reason string) {
 	}
 	ms.Rebind()
 	ms.ReSTUN(reason)
+	t.recordRebind(reason)
 	t.stMu.Lock()
 	t.st = nil
 	t.stMu.Unlock()
 	log.Printf("[tsnet] magicsock rebound (%s)", reason)
+}
+
+// recordRebind and recordRestart stamp the recovery telemetry surfaced in
+// StatusJSON. Only actual socket operations are counted (nil-guarded early
+// returns in rebindMagicsock/restartServer don't reach here), so the counts
+// reflect what truly ran on the device, not attempts.
+func (t *Tailscale) recordRebind(reason string) {
+	t.telMu.Lock()
+	t.rebindCount++
+	t.lastRebindAt = time.Now()
+	t.lastRebindReason = reason
+	t.telMu.Unlock()
+}
+
+func (t *Tailscale) recordRestart(reason string) {
+	t.telMu.Lock()
+	t.restartCount++
+	t.lastRestartAt = time.Now()
+	t.lastRestartReason = reason
+	t.telMu.Unlock()
+}
+
+// recoverySnapshot is the self-heal telemetry embedded in StatusJSON under
+// "recovery". needsRebind is the live health verdict at read time; the counts
+// and timestamps are cumulative for the current node's lifetime.
+type recoverySnapshot struct {
+	NeedsRebind       bool   `json:"needsRebind"`
+	HealAttempts      int    `json:"healAttempts"`
+	Rebinds           int    `json:"rebinds"`
+	LastRebindAt      string `json:"lastRebindAt,omitempty"`
+	LastRebindReason  string `json:"lastRebindReason,omitempty"`
+	Restarts          int    `json:"restarts"`
+	LastRestartAt     string `json:"lastRestartAt,omitempty"`
+	LastRestartReason string `json:"lastRestartReason,omitempty"`
+}
+
+// recovery assembles the self-heal telemetry for StatusJSON. health is the
+// just-fetched health string list so needsRebind reflects the same read the
+// consumer sees, not a stale cache.
+func (t *Tailscale) recovery(health []string) recoverySnapshot {
+	t.telMu.Lock()
+	rc, rat, rr := t.rebindCount, t.lastRebindAt, t.lastRebindReason
+	sc, sat, sr := t.restartCount, t.lastRestartAt, t.lastRestartReason
+	t.telMu.Unlock()
+	t.healMu.Lock()
+	ha := t.healAttempts
+	t.healMu.Unlock()
+	fmtTime := func(tm time.Time) string {
+		if tm.IsZero() {
+			return ""
+		}
+		return tm.UTC().Format(time.RFC3339)
+	}
+	return recoverySnapshot{
+		NeedsRebind:       healthNeedsRebind(health),
+		HealAttempts:      ha,
+		Rebinds:           rc,
+		LastRebindAt:      fmtTime(rat),
+		LastRebindReason:  rr,
+		Restarts:          sc,
+		LastRestartAt:     fmtTime(sat),
+		LastRestartReason: sr,
+	}
 }
 
 // healthNeedsRebind reports whether any health warning says magicsock's
@@ -404,6 +481,7 @@ func (t *Tailscale) restartServer(reason string) {
 	t.mu.Unlock()
 
 	log.Printf("[tsnet] restarting node (%s)", reason)
+	t.recordRestart(reason)
 	old.Close()
 
 	ns := t.newServer()
@@ -588,8 +666,9 @@ func (t *Tailscale) StatusJSON() (string, error) {
 			Name           string `json:"name"`
 			MagicDNSSuffix string `json:"magicDNSSuffix"`
 		} `json:"tailnet,omitempty"`
-		Self  *node  `json:"self,omitempty"`
-		Peers []node `json:"peers"`
+		Self     *node            `json:"self,omitempty"`
+		Peers    []node           `json:"peers"`
+		Recovery recoverySnapshot `json:"recovery"`
 	}{
 		Running:      true,
 		Identity:     t.identity,
@@ -597,6 +676,7 @@ func (t *Tailscale) StatusJSON() (string, error) {
 		BackendState: st.BackendState,
 		Health:       st.Health,
 		Peers:        []node{},
+		Recovery:     t.recovery(st.Health),
 	}
 	if st.CurrentTailnet != nil {
 		out.Tailnet = &struct {

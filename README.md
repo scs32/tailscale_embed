@@ -65,7 +65,7 @@ dependencies:
   tailscale_embed:
     git:
       url: https://github.com/scs32/tailscale_embed.git
-      ref: v0.3.3
+      ref: v0.3.4
 ```
 
 Pin a version tag rather than `main` or a commit hash: tags communicate
@@ -193,6 +193,14 @@ settings pages and connection indicators: backend state, health warnings,
 active identity, tailnet name / MagicDNS suffix, self node (hostname, DNS
 name, IPs), and the peer list with per-peer online state and advertised
 routes.
+
+`status().recovery` (a `TailscaleRecovery`, null when stopped) exposes the
+self-heal telemetry for the "MagicSock function ReceiveIPv4 is not running"
+warning: `needsRebind` (the watchdog's live trigger), `healAttempts`, and the
+cumulative `rebinds` / `restarts` counts with their last reason + UTC timestamp.
+It's diagnostic — most apps can ignore it — but it lets a settings/status page
+attribute a field occurrence: when the warning clears, whether a magicsock
+rebind or a full node restart was what fired.
 
 ### Errors
 

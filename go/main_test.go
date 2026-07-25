@@ -328,6 +328,45 @@ func TestRestartServerNotRunning(t *testing.T) {
 	(&Tailscale{}).restartServer("test")
 }
 
+// Recovery telemetry is the whole point of this build: it must count only real
+// rebinds/restarts, carry the last reason + timestamp, reflect the passed-in
+// health for needsRebind, and serialize zero timestamps as empty (omitempty).
+func TestRecoveryTelemetry(t *testing.T) {
+	ts := &Tailscale{}
+
+	snap := ts.recovery(nil)
+	if snap.NeedsRebind || snap.Rebinds != 0 || snap.Restarts != 0 || snap.HealAttempts != 0 {
+		t.Fatalf("zero-value recovery should be empty, got %+v", snap)
+	}
+	if snap.LastRebindAt != "" || snap.LastRestartAt != "" {
+		t.Errorf("zero timestamps must serialize empty, got %+v", snap)
+	}
+
+	ts.recordRebind("tsembed-resume")
+	ts.recordRebind("tsembed-pathchange")
+	ts.recordRestart("tsembed-selfheal-restart")
+	ts.healMu.Lock()
+	ts.healAttempts = 3
+	ts.healMu.Unlock()
+
+	snap = ts.recovery([]string{"The MagicSock function ReceiveIPv4 is not running"})
+	if !snap.NeedsRebind {
+		t.Error("needsRebind should reflect the passed-in health")
+	}
+	if snap.Rebinds != 2 || snap.LastRebindReason != "tsembed-pathchange" {
+		t.Errorf("rebind telemetry wrong: %+v", snap)
+	}
+	if snap.Restarts != 1 || snap.LastRestartReason != "tsembed-selfheal-restart" {
+		t.Errorf("restart telemetry wrong: %+v", snap)
+	}
+	if snap.HealAttempts != 3 {
+		t.Errorf("healAttempts = %d, want 3", snap.HealAttempts)
+	}
+	if snap.LastRebindAt == "" || snap.LastRestartAt == "" {
+		t.Error("timestamps should be set after record*")
+	}
+}
+
 // newServer must carry the retained config so the watchdog's rebuilt server
 // is identical to the original (same state dir → same node identity).
 func TestNewServerCarriesConfig(t *testing.T) {
