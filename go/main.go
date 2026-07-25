@@ -67,9 +67,12 @@ const statusCacheTTL = 3 * time.Second
 // proxied dial.
 const selfHealInterval = 30 * time.Second
 
-// selfHealRestartInterval rate-limits the watchdog's escalation to a full
-// tsnet server restart. A restart that worked clears the warning well within
-// this window; one that didn't shouldn't restart-loop the node.
+// selfHealRestartInterval would rate-limit a watchdog restart escalation.
+// RETAINED for a possible future Option B (restart gated on real
+// total-failure): the watchdog no longer auto-restarts — a restart's ~45s
+// down window is a hard outage, worse than the benign relay-degradation the
+// ReceiveIPv4 warning represents (see maybeSelfHeal). Kept so B can be added
+// data-driven if the recovery telemetry ever shows rebind can't recover.
 const selfHealRestartInterval = 2 * time.Minute
 
 // Tailscale wraps tsnet.Server and provides an HTTP proxy for routing traffic.
@@ -98,8 +101,10 @@ type Tailscale struct {
 	st   *ipnstate.Status
 	stAt time.Time
 
-	healMu       sync.Mutex
-	lastHeal     time.Time
+	healMu   sync.Mutex
+	lastHeal time.Time
+	// lastRestart is retained for a future Option B gated restart; the
+	// watchdog no longer auto-restarts (see maybeSelfHeal / selfHealRestartInterval).
 	lastRestart  time.Time
 	healAttempts int
 
@@ -514,21 +519,33 @@ func (t *Tailscale) restartServer(reason string) {
 }
 
 // maybeSelfHeal is the watchdog half of the recovery story: whenever a
-// freshly fetched status carries the dead-receive-path warning, heal
-// (rate-limited by selfHealInterval). Recovery is thereby observable-state-
-// driven, catching whatever the resume hook and the native path monitor miss
-// — status() runs on every proxied dial and every StatusJSON, so a degraded
-// node heals as soon as anything looks at it.
+// freshly fetched status carries the dead-receive-path warning, rebind
+// magicsock (rate-limited by selfHealInterval). Recovery is thereby
+// observable-state-driven, catching whatever the resume hook and the native
+// path monitor miss — status() runs on every proxied dial and every
+// StatusJSON, so a degraded node heals as soon as anything looks at it. A
+// healthy status resets the attempt counter. The heal runs async: status()
+// backs dials and must not block on socket churn (and it still holds stMu,
+// which rebindMagicsock takes to drop the cache).
 //
-// Healing escalates: the first attempt is a cheap magicsock rebind; if the
-// warning survives into a second attempt (≥selfHealInterval later, i.e. the
-// rebind demonstrably didn't fix it — field evidence and source both say it
-// can't once the receive goroutine has exited), do the full server restart,
-// the only recovery ever observed to clear this state. Restarts are further
-// rate-limited by selfHealRestartInterval. A healthy status resets the
-// ladder. Heals run async: status() backs dials and must not block on
-// socket churn (and it still holds stMu, which both heal paths take to drop
-// the cache).
+// The watchdog does the cheap, non-disruptive rebind ONLY — it deliberately
+// never escalates to a full tsnet restart. The "ReceiveIPv4 not running"
+// warning is NOT an outage: when it shows, traffic keeps flowing over DERP
+// relay (field-confirmed 2026-07-25 — the node answered only via DERP while
+// the warning was up, but services stayed reachable). A full restart, by
+// contrast, tears the node down for the duration of its Up() (up to
+// upTimeout); while it is down, status() throws and tailnet dials fall back
+// to a direct path that can't route CGNAT/MagicDNS, so EVERY tailnet host
+// fails for ~45s — a hard outage in exchange for clearing a benign
+// relay-degradation warning (v0.3.3's mistake; both the plugin's live capture
+// and the Tailarr field reports of app-wide failures during restarts agree).
+// A rebind, swapping sockets under the still-running node, occasionally wins
+// the death-spiral race or nudges re-STUN and costs nothing when it doesn't.
+//
+// restartServer + its telemetry are kept in the tree for a possible future
+// Option B (restart gated on real total-failure — backend not Running AND
+// DERP also down), to be added only if the recovery counters ever show a case
+// rebind alone can't handle. Today there is zero field evidence of one.
 func (t *Tailscale) maybeSelfHeal(st *ipnstate.Status) {
 	if st == nil {
 		return
@@ -547,26 +564,14 @@ func (t *Tailscale) maybeSelfHeal(st *ipnstate.Status) {
 	t.lastHeal = time.Now()
 	t.healAttempts++
 	attempt := t.healAttempts
-	escalate := attempt >= 2 && time.Since(t.lastRestart) >= selfHealRestartInterval
-	if escalate {
-		t.lastRestart = time.Now()
-	}
-	rebind, restart := t.rebindFn, t.restartFn
+	rebind := t.rebindFn
 	t.healMu.Unlock()
 
 	if rebind == nil {
 		rebind = t.rebindMagicsock
 	}
-	if restart == nil {
-		restart = t.restartServer
-	}
-	if escalate {
-		log.Printf("[tsnet] magicsock receive path still dead after rebind (attempt %d); escalating to full node restart", attempt)
-		go restart("tsembed-selfheal-restart")
-	} else {
-		log.Printf("[tsnet] health reports dead magicsock receive path; self-healing (attempt %d)", attempt)
-		go rebind("tsembed-selfheal")
-	}
+	log.Printf("[tsnet] health reports dead magicsock receive path; rebinding (attempt %d)", attempt)
+	go rebind("tsembed-selfheal")
 }
 
 // StopProxy stops the HTTP proxy and tsnet server.

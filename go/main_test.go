@@ -249,26 +249,27 @@ func TestStatusJSONIdentityNotRunning(t *testing.T) {
 	}
 }
 
-// The heal ladder: attempt 1 rebinds (cheap first aid), attempt 2+ escalates
-// to a full server restart — field evidence (v0.3.2 failure) and the
-// magicsock source agree a rebind cannot revive an exited receive goroutine,
-// so a warning that survives one rebind window demands the restart. Restarts
-// are additionally rate-limited; a healthy status resets the ladder.
-func TestMaybeSelfHealEscalation(t *testing.T) {
-	rebinds := make(chan string, 8)
-	restarts := make(chan string, 8)
+// The watchdog is rebind-ONLY: it must never escalate to a full node restart,
+// no matter how long the warning persists. A restart's ~45s down window is a
+// hard tailnet outage, worse than the benign relay-degradation the ReceiveIPv4
+// warning represents (v0.3.3 shipped the outage; v0.3.5 removes it). The
+// warning clearing via rebind/naturally is the intended path; restarts must
+// stay at 0. A healthy status resets the attempt counter.
+func TestMaybeSelfHealRebindOnlyNeverRestarts(t *testing.T) {
+	rebinds := make(chan string, 16)
+	restarts := make(chan string, 16)
 	ts := &Tailscale{
 		rebindFn:  func(r string) { rebinds <- r },
-		restartFn: func(r string) { restarts <- r },
+		restartFn: func(r string) { restarts <- r }, // must NEVER fire
 	}
 	sick := &ipnstate.Status{Health: []string{"The MagicSock function ReceiveIPv4 is not running."}}
 
-	expect := func(step string, ch chan string) {
+	expectRebind := func(step string) {
 		t.Helper()
 		select {
-		case <-ch:
+		case <-rebinds:
 		case <-time.After(2 * time.Second):
-			t.Fatalf("%s: expected heal action did not fire", step)
+			t.Fatalf("%s: expected a rebind, none fired", step)
 		}
 	}
 	expectQuiet := func(step string) {
@@ -283,41 +284,32 @@ func TestMaybeSelfHealEscalation(t *testing.T) {
 	}
 
 	ts.maybeSelfHeal(sick) // attempt 1 → rebind
-	expect("attempt 1", rebinds)
-	expectQuiet("attempt 1 must not also restart")
+	expectRebind("attempt 1")
 
-	ts.maybeSelfHeal(sick) // inside selfHealInterval → suppressed
+	ts.maybeSelfHeal(sick) // within selfHealInterval → suppressed
 	expectQuiet("rate-limited")
 
-	ts.healMu.Lock()
-	ts.lastHeal = time.Now().Add(-selfHealInterval - time.Second)
-	ts.healMu.Unlock()
-	ts.maybeSelfHeal(sick) // attempt 2 → escalate to restart
-	expect("attempt 2", restarts)
-	expectQuiet("attempt 2 must not also rebind")
+	// Persist the warning across many heal windows — every one must rebind,
+	// none may ever restart.
+	for i := 2; i <= 6; i++ {
+		ts.healMu.Lock()
+		ts.lastHeal = time.Now().Add(-selfHealInterval - time.Second)
+		ts.healMu.Unlock()
+		ts.maybeSelfHeal(sick)
+		expectRebind(fmt.Sprintf("attempt %d", i))
+	}
+	select {
+	case r := <-restarts:
+		t.Fatalf("watchdog must never restart, got %q", r)
+	default:
+	}
 
-	ts.healMu.Lock()
-	ts.lastHeal = time.Now().Add(-selfHealInterval - time.Second)
-	ts.healMu.Unlock()
-	ts.maybeSelfHeal(sick) // attempt 3, restart rate-limited → rebind again
-	expect("attempt 3 falls back to rebind", rebinds)
-
-	ts.healMu.Lock()
-	ts.lastHeal = time.Now().Add(-selfHealInterval - time.Second)
-	ts.lastRestart = time.Now().Add(-selfHealRestartInterval - time.Second)
-	ts.healMu.Unlock()
-	ts.maybeSelfHeal(sick) // restart window reopened → restart
-	expect("attempt 4 restarts again", restarts)
-
-	ts.maybeSelfHeal(&ipnstate.Status{}) // healthy → ladder resets
+	ts.maybeSelfHeal(&ipnstate.Status{}) // healthy → counter resets
 	ts.healMu.Lock()
 	if ts.healAttempts != 0 {
 		t.Errorf("healthy status should reset healAttempts, got %d", ts.healAttempts)
 	}
-	ts.lastHeal = time.Now().Add(-selfHealInterval - time.Second)
 	ts.healMu.Unlock()
-	ts.maybeSelfHeal(sick) // fresh episode → back to rebind
-	expect("fresh episode restarts the ladder at rebind", rebinds)
 }
 
 // restartServer must be a quiet no-op when the node isn't running (watchdog

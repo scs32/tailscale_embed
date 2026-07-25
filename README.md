@@ -24,14 +24,17 @@ has been running in production on iOS since July 2026.
 - **`TailscaleGuard`** re-checks node + listener health on launch/foreground
   (iOS reclaims sockets during suspension) behind a blocking overlay. The
   resume path also rebinds magicsock's UDP sockets (as the official iOS
-  client does on wake) — without it the node comes back with dead receive
+  client does on wake) — without it the node can come back with dead receive
   loops (the "MagicSock function ReceiveIPv4 is not running" health
-  warning) and silently degrades to DERP relay. A built-in **watchdog**
-  backstops this: whenever a status read shows that warning, the node
-  self-heals — a magicsock rebind first, escalating to a **full in-place
-  node restart** if the warning persists (a rebind cannot revive an exited
-  receive goroutine; only a restart respawns it). The restart happens behind
-  the same proxy port, so apps never notice.
+  warning) and degrade to DERP relay. A built-in **watchdog** backstops this:
+  whenever a status read shows that warning, it does a cheap, non-disruptive
+  **magicsock rebind** (swaps the UDP sockets under the still-running node),
+  rate-limited. The rebind never tears the node down, so traffic is never
+  interrupted. Note the warning itself is **not an outage** — while it shows,
+  traffic keeps flowing over DERP relay; it's a graceful degradation, and the
+  watchdog deliberately does **not** restart the node to chase it (an earlier
+  build did, and the restart's brief down window caused worse, app-wide tailnet
+  stalls). `status().recovery` surfaces what the watchdog has done.
 - MagicDNS names are resolved **on-device from the node's peer list** — the
   phone has no system MagicDNS, so the proxy does it itself. That includes
   bare **short names** (`truenas-ts`, not just
@@ -65,7 +68,7 @@ dependencies:
   tailscale_embed:
     git:
       url: https://github.com/scs32/tailscale_embed.git
-      ref: v0.3.4
+      ref: v0.3.5
 ```
 
 Pin a version tag rather than `main` or a commit hash: tags communicate
