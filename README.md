@@ -68,7 +68,7 @@ dependencies:
   tailscale_embed:
     git:
       url: https://github.com/scs32/tailscale_embed.git
-      ref: v0.3.5
+      ref: v0.3.6
 ```
 
 Pin a version tag rather than `main` or a commit hash: tags communicate
@@ -108,6 +108,18 @@ void main() {
   ));
 }
 ```
+
+`TailscaleGuard`'s blocking overlay is **bounded** so a wedged connect can't
+lock the app out. Each attempt has a hard `connectTimeout` (default 60s) after
+which the overlay clears and input returns while the connect keeps coming up in
+the background; an earlier `escapeAfter` (default 8s) grows a
+"Continue anyway / Retry" affordance on the overlay. If an attempt hits the
+timeout the guard also shows a **non-blocking** "connection stuck" notice — a
+Dart-side timeout can't cancel a wedged native `Up()`, and because
+`TailscaleEmbed` serializes its operations a genuinely stuck connect leaves
+later `ensure()`/`stop()` calls (profile switches, disconnect buttons) queued
+behind it, so the honest recovery is to reopen the app. Word it for your app
+(or replace it) via `stuckNoticeBuilder:`.
 
 The node is **persistent** by default (`ephemeral: false`): the auth key is
 needed exactly once; the identity survives restarts like a normal device, so

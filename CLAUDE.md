@@ -1,6 +1,198 @@
 # tailscale_embed — session notes
 
-## Watchdog restart-escalation session (2026-07-24, latest): v0.3.3
+## Guard lockup + adversarial-review session (2026-07-26, latest): v0.3.6
+
+**Fixed the consumer-reported app-wide lockup** (Tailarr build 18: a
+Delete-Profile dialog over server-owned profiles froze all input, screen
+frozen underneath, across tailnets — `~/projects/build18-lockup-profiles-delete.jpg`).
+Root cause in `lib/src/guard.dart`: `_TailscaleGuardState` rendered a
+full-screen `AbsorbPointer` whenever `_connecting`, set around `embed.ensure()`
+and reset only in that call's `finally` — with `if (_connecting) return;` also
+blocking retries. A hung `ensure()` (node wedged in Starting after a burst of
+serialized ensure/stop/deleteIdentity, or an across-tailnet switch) pinned the
+overlay forever. No timeout, no escape.
+
+**Fix (Dart-only, no xcframework rebuild — Framework.lock stays
+`framework-v1.92.5-6`):**
+- `connectTimeout` (default 60s, > native upTimeout ~45s): hard ceiling via
+  `.timeout()`; on elapse overlay clears + input returns, ensure() keeps coming
+  up in background. `TimeoutException` → onError.
+- `escapeAfter` (default 8s): overlay grows a "Continue anyway / Retry" panel
+  rendered ABOVE the AbsorbPointer (tappable — a consumer's overlayBuilder
+  can't add it). Continue = dismiss block, keep connecting; Retry = fresh
+  attempt.
+- Attempt-generation counter (`_attempt`/`myAttempt`) so a Retry supersedes a
+  wedged attempt without the stale one clobbering state; stale attempt's
+  timeout is silenced (doesn't fire onError — Codex #7).
+- **Non-blocking "connection stuck" notice** on timeout (`stuckNoticeBuilder`,
+  default app-neutral "Tailscale isn't responding … reopen it to recover").
+  The honest surfacing: because `embed` serializes ops, a genuinely-wedged
+  native `ensure()` poisons the shared `_serial` queue — every later
+  ensure()/stop() (Tailarr's profile switch, profile delete, Basic-mode "Leave
+  Server") queues behind it and re-hangs; force-quit is the real recovery, so
+  the notice says so instead of handing back a dead-looking-fine UI.
+- Also landed **Codex #10** (free, isolated): `settings_panel.dart`
+  `_deleteIdentity`/`_apply` now `mounted`-guard every post-await setState, and
+  `_deleteIdentity` sets `_busy` (no overlapping deletes). N/A for Tailarr (own
+  settings UI) but helps other consumers.
+
+**Verified:** `flutter analyze` clean (lib + test); `flutter test` **33/33**
+(+6 guard tests in new `test/guard_test.dart`: timeout clears wedged overlay,
+escape/Continue frees input, Retry succeeds, stuck notice appears/dismissible,
+success clears notice, stale-onError silenced). Test gotchas (both the zone
+trap `embed.dart` documents): the fake's gate Completer is created lazily
+INSIDE `ensure()` (FakeAsync zone) — a setUp-created one lives in the real zone
+and completing it from the body never delivers under `tester.pump()`; and
+`tearDown` has a real-timer `stop().timeout(2s)` backstop so a hung chain can't
+deadlock the run. Run tests with `--timeout=Ns` so a stall fails fast (this
+machine's cold `flutter test` compile is brutally slow).
+
+### Codex adversarial review (read-only, this session)
+Ran `codex exec --sandbox read-only` over the whole package. 12 findings;
+triage validated against a Tailarr consumer lens. Dispositions:
+- **#1 (Critical) — wedged ensure() poisons the `_serialized` queue**: REAL and
+  the ask-#3 item. UI recovers (guard timeout) but the singleton is poisoned;
+  Tailarr's every recovery path routes through the same queue, so a real wedge
+  disables all in-app exits → force-quit only. Dart-side `_serialized` timeout
+  is DANGEROUS (would race a new start() against a live native Up() → the
+  two-instances-share-a-state-dir crash). Correct fix = native `Up()`
+  cancellation (big). **Deferred, telemetry-gated**: Tailarr's Self-Heal card
+  surfaces rebind/restart counters — if the TestFlight fleet shows real
+  full-RESTARTS firing (the thing that caused the lockup), that graduates #1
+  from roadmap to priority. The v0.3.6 stuck notice is the stopgap. Fold
+  **#6 (sync stopProxy on iOS platform thread)** and **#9 (rebind races stop)**
+  into this one native investigation.
+- **#2 (High) — rollback port drift PROMOTED**: failed identity restart that
+  successfully rolls back may rebind on a NEW port, but Swift's error carries
+  only rolledBack/activeIdentity, not the port → Dart keeps advertising the
+  dead one → silent per-profile connectivity loss until app restart. Edge case
+  for single-identity, but Tailarr's MAIN path (per-profile identities, ~31
+  call sites). Fix = Swift returns rollback port + Dart `_adoptPort`s it. NOT
+  done yet.
+- **#4 (High)** — hijacked CONNECT tunnels not closed by StopProxy (leak
+  goroutines/fds, can outlive stop()/identity switch): real, matters for
+  Tailarr's per-switch churn. Bundle with the native investigation.
+- **#5 (High)** — `_adoptPort` sets port before awaiting installWebViewProxy, so
+  a webview-proxy failure makes a successful start throw + skips onKeyConsumed.
+  N/A Tailarr (no webViewProxy). Real for webview users; not done.
+- **#10** — landed (see above).
+- **#3/#12** — bare-short-name fail-open + broad short-name capture: DOCUMENTED
+  intentional tradeoff (the `truenas-ts` feature); Tailarr's server-driven path
+  FQDN-resolves everything. Docs-hardening note only, don't fail closed.
+- **#8** (#1's testability face), **#11** (mid-flight configure()/unserialized
+  reads) — minor/edge, N/A for Tailarr's usage.
+
+### Released / handoff
+- Version 0.3.6 (pubspec + podspec), README `ref: v0.3.6`, guard docs added.
+  **Commit + tag `v0.3.6` on main** (Dart-only; no framework republish — the
+  `framework-v1.92.5-6` asset is unchanged and still SHA-pinned).
+- Tailarr will `flutter pub upgrade` + re-pin `ref: v0.3.6`, wire
+  `stuckNoticeBuilder` to name the app ("reopen Tailarr"). Tailarr in-flight:
+  Quick Connect app half (pairing foundation committed+inert; self-config UI +
+  Bearer wiring unfinished; open E2E finding awaiting a fresh key) — they'll
+  either finish QC then bundle the embed rev, or ship Basic-mode + lockup
+  debounce sooner and let QC ride the next build.
+- Tailarr already app-side debounced `syncTailscaleToProfile()` 600ms (cuts the
+  churn that wedges the node; can't un-poison an already-stuck queue — the
+  guard fix is the real one).
+
+### Next session, in order
+1. Await Tailarr's telemetry read on whether full-RESTARTS fire in the wild
+   (the green light for #1 native `Up()` cancellation — see memories
+   `magicsock-receiveipv4-rootcause`, `-live-capture`). If yes, scope #1 + #4 +
+   #6 + #9 as one native investigation.
+2. Consider #2 (rollback port drift) — promoted; Swift+Dart, Tailarr main path.
+3. Real-key end-to-end (unchanged; needs user's fresh `tskey-auth-…` × 2). Sim
+   `ts-browser-test` (9540842C-9F8C-4482-B159-85E4B2BC967C) still exists.
+4. Follow up on Plezy adoption of v0.3.0 reply (not yet confirmed landed).
+5. Gap 5 ("Android + TV input", incl. QR/pairing auth) — top roadmap item.
+
+## Diagnose-then-defang session (2026-07-25): v0.3.4 + v0.3.5
+
+**Root-caused the ReceiveIPv4 warning for real, then found v0.3.3's restart was
+the actual harm and removed it.** Two releases this session.
+
+### Source proof (tailscale v1.92.5, module cache — cited in memory)
+- Warning ⟺ receive goroutine **exited**. `Status.Health`
+  (ipnlocal/local.go:1252) = `health.Strings()`, a LATCHED warnable. `f.missing`
+  is recomputed ONLY by the 1-min `AfterFunc` timer `timerSelfCheck`
+  (health.go:152/966/1350); status reads see the stale flag. `checkReceiveFuncs`
+  marks a func healthy if numCalls rose OR `inCall==true` — a goroutine merely
+  BLOCKED in ReadBatch reads healthy. So a live goroutine clears the warning
+  within ≤60s even with zero traffic ⇒ persisting-many-minutes = goroutine dead.
+- wireguard-go `RoutineReceiveIncoming` (tailscale/wireguard-go
+  @20250716, device/receive.go:110-125) `return`s on net.ErrClosed /
+  non-temporary errors (iOS socket teardown). `device.BindUpdate()`
+  (device.go:471-529) is the ONLY thing that relaunches it — and **tailscale
+  NEVER calls BindUpdate** (grep: 0 non-test refs). magicsock swaps sockets
+  under live goroutines via `RebindingUDPConn`; `Conn.Rebind()` only helps if it
+  wins the ~3.3s death-spiral race before the goroutine exits. So a truly-exited
+  goroutine needs a full server recreation.
+
+### Live capture (2026-07-25, "it's happening" — decisive)
+This Mac (`stephens-macbook-air`, 100.104.98.91) is on the SAME tailnet as the
+Tailarr iOS device (`tailarr-app-tailarr-g1upwm` / 100.91.220.64). While the
+warning showed: `tailscale ping` = **DERP(sea) only, never upgrades** ("direct
+connection not established") ⇒ **REAL, not cosmetic** — receive path degraded to
+relay, traffic still worked. After ~4 min foregrounded it recovered to
+**direct** (`10.10.10.108:...`) and the warning cleared — **with NO peer blink**
+⇒ **no full restart fired**. So recovery came from rebind/natural, and the
+v0.3.3 restart was never the hero.
+
+### v0.3.4 — recovery telemetry (instrument, don't guess)
+Since blind mechanism changes kept missing, added observability. `StatusJSON`
+now carries `"recovery"` (needsRebind, healAttempts, cumulative rebinds/restarts
++ last reason + UTC RFC3339 timestamp), surfaced as
+`TailscaleStatus.recovery` (`TailscaleRecovery`, null when stopped). Go
+recordRebind/recordRestart + `recovery()`; +Dart model; +tests. Framework
+**framework-v1.92.5-5**. NOTE: v0.3.4 still shipped the restart — superseded by
+v0.3.5 below; do not pin v0.3.4.
+
+### v0.3.5 — watchdog is REBIND-ONLY (the fix)
+Tailarr reported app-wide outages (Users/Radarr failing, "Try Again didn't
+work") — traced to v0.3.3's restart: `old.Close()` then new `Up()` (≤upTimeout
+~45s); while down, `status()` throws and `dial()` falls back to a direct path
+that can't route CGNAT/MagicDNS ⇒ EVERY tailnet host fails for ~45s. A hard
+outage traded for clearing a benign relay-degradation warning. **Option A
+chosen** (user strong lean): `maybeSelfHeal` now does the cheap non-disruptive
+**rebind ONLY**, never auto-restarts. `restartServer` + telemetry +
+`selfHealRestartInterval`/`lastRestart` RETAINED (unused) for a future Option B
+(restart gated on real total-failure: backend not Running AND DERP down) — add
+only if telemetry ever shows rebind can't recover; no such evidence today. Test
+replaced: `TestMaybeSelfHealRebindOnlyNeverRestarts`. Framework
+**framework-v1.92.5-6** (Framework.lock SHA256
+`cba3bae617b134f02054e5b0460d2479ba6c55624f06552a2aba23f6407974ec`).
+
+**Released (git-verified, pushed):** v0.3.4 (`b01ff0a`, tag v0.3.4) then v0.3.5
+(`22b66c3`, tag v0.3.5) on main. Both: `go test -race` green, `flutter analyze`
+clean, `flutter test` **27/27**, example `flutter build ios --simulator` links
+the rebuilt framework; published assets re-downloaded + SHA256-verified. README
+ref → v0.3.5, watchdog docs rewritten (rebind-only; warning = graceful DERP
+degradation, not an outage).
+
+### Consumer coordination (Tailarr)
+Tailarr already pinned v0.3.4 and added a Self-Heal Telemetry card
+(rebinds/restarts + timestamps, restarts front-and-center) to its Status page,
+and softened the Status copy to "reconnecting, refreshes automatically." Handoff
+sent: **re-pin v0.3.4 → `ref: v0.3.5`** (framework-v1.92.5-6) before their next
+build — one build = telemetry + outage fix. Soak proof: when the warning
+appears/clears, `restarts` stays **0**, `rebinds` increments, no app-wide stalls.
+
+### Next session, in order
+1. Await Tailarr v0.3.5 soak report. On next "it's happening": read the phone's
+   recovery telemetry (restarts should be 0) AND run the Mac `tailscale ping`
+   capture — see memory [[magicsock-receiveipv4-live-capture]]. If telemetry
+   ever shows the warning persisting with rebinds climbing and traffic genuinely
+   dead (not just DERP), THAT is the evidence to build Option B.
+2. Real-key end-to-end (unchanged, needs user's fresh `tskey-auth-…` × 2). Sim
+   `ts-browser-test` (9540842C-9F8C-4482-B159-85E4B2BC967C) still exists.
+3. Follow up on Plezy adoption of v0.3.0 reply (not yet confirmed landed).
+4. Gap 5 ("Android + TV input", incl. QR/pairing auth) — top roadmap item.
+
+Memory files added this session:
+`magicsock-receiveipv4-rootcause`, `magicsock-receiveipv4-live-capture`.
+
+## Watchdog restart-escalation session (2026-07-24): v0.3.3
 
 **v0.3.2 FAILED closing verification** — third field sighting
 (`~/projects/magicsock-receiveipv4-v032-build15.jpg`): real device on

@@ -162,13 +162,19 @@ class _TailscaleSettingsPanelState extends State<TailscaleSettingsPanel> {
   }
 
   Future<void> _deleteIdentity(String identity) async {
+    if (_busy) return; // no overlapping deletes/applies
+    setState(() => _busy = true);
     try {
       await TailscaleEmbed.instance.deleteIdentity(identity);
-      setState(() => _status = 'Deleted identity "$identity"');
+      if (mounted) setState(() => _status = 'Deleted identity "$identity"');
     } catch (error) {
-      setState(() => _status = TailscaleAuthKeys.friendlyError(error));
+      if (mounted) {
+        setState(() => _status = TailscaleAuthKeys.friendlyError(error));
+      }
+    } finally {
+      await _refreshIdentities(); // mounted-guarded internally
+      if (mounted) setState(() => _busy = false);
     }
-    await _refreshIdentities();
   }
 
   Future<void> _apply() async {
@@ -199,25 +205,29 @@ class _TailscaleSettingsPanelState extends State<TailscaleSettingsPanel> {
         final port = await embed.restart();
         final st = await embed.status();
         final self = st?.self;
-        setState(() {
-          _status = self != null
-              ? 'Connected as '
-                  '${self.dnsName.isNotEmpty ? self.dnsName : self.hostName} '
-                  '(${self.ips.join(', ')}) — identity '
-                  '"${st!.identity ?? '?'}" — '
-                  '${st.onlinePeerCount}/${st.peers.length} peers online, '
-                  'proxy on port $port'
-              : 'Connected — local proxy on port $port';
-          // onKeyConsumed may have cleared the stored key; reflect that.
-          _keyController.text = store.authKeyFor(store.identity);
-        });
+        if (mounted) {
+          setState(() {
+            _status = self != null
+                ? 'Connected as '
+                    '${self.dnsName.isNotEmpty ? self.dnsName : self.hostName} '
+                    '(${self.ips.join(', ')}) — identity '
+                    '"${st!.identity ?? '?'}" — '
+                    '${st.onlinePeerCount}/${st.peers.length} peers online, '
+                    'proxy on port $port'
+                : 'Connected — local proxy on port $port';
+            // onKeyConsumed may have cleared the stored key; reflect that.
+            _keyController.text = store.authKeyFor(store.identity);
+          });
+        }
       } else {
         await embed.stop();
-        setState(() => _status = 'Tailscale disabled');
+        if (mounted) setState(() => _status = 'Tailscale disabled');
       }
       widget.onApplied?.call();
     } catch (error) {
-      setState(() => _status = TailscaleAuthKeys.friendlyError(error));
+      if (mounted) {
+        setState(() => _status = TailscaleAuthKeys.friendlyError(error));
+      }
     } finally {
       await _refreshIdentities();
       if (mounted) setState(() => _busy = false);
