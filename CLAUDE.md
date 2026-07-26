@@ -84,8 +84,10 @@ triage validated against a Tailarr consumer lens. Dispositions:
 
 ### Released / handoff
 - Version 0.3.6 (pubspec + podspec), README `ref: v0.3.6`, guard docs added.
-  **Commit + tag `v0.3.6` on main** (Dart-only; no framework republish — the
-  `framework-v1.92.5-6` asset is unchanged and still SHA-pinned).
+  **RELEASED (git-verified on origin):** commit `9e2d08d` on `main`, annotated
+  tag `v0.3.6` (`647e4a0`) pushed; tree clean. Dart-only — NO framework
+  republish (the `framework-v1.92.5-6` asset is unchanged and still SHA-pinned
+  in Framework.lock). Consumers pin `ref: v0.3.6`.
 - Tailarr will `flutter pub upgrade` + re-pin `ref: v0.3.6`, wire
   `stuckNoticeBuilder` to name the app ("reopen Tailarr"). Tailarr in-flight:
   Quick Connect app half (pairing foundation committed+inert; self-config UI +
