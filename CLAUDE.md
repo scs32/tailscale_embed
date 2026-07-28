@@ -1,6 +1,61 @@
 # tailscale_embed — session notes
 
-## Dual-agent review + fix-bundle session (2026-07-28, latest): v0.3.7
+## Dual-agent review + fix-bundle session (2026-07-28, latest): v0.3.7 → v0.3.8
+
+### v0.3.8 — self-review of the v0.3.7 diff (both agents, again)
+After shipping v0.3.7 I ran the SAME two agents (Fable 5 subagent + Codex CLI)
+adversarially over **the v0.3.7 diff itself** ("find regressions I introduced").
+Both **independently converged on the same two real holes in my own StopProxy
+changes** — strong signal, not noise — plus Codex added a third (a race the
+STATUS_UNAVAILABLE change opened). All three were fixed in v0.3.8 (Go-only, so a
+framework rebuild; no Dart/Swift change):
+
+1. **[both] Plain-HTTP streams outlived stop.** The new tunnel registry closes
+   only *hijacked CONNECT* conns; `handleHTTP` streams are ordinary handlers that
+   `proxy.Shutdown` doesn't force-close — and v0.3.7 removed the `WriteTimeout`
+   that used to reap them. A long plain-`http://` download to a *direct* (non-
+   tailnet) host would keep its handler/fd/upstream conn alive past an identity
+   switch. Fix: `if err := t.proxy.Shutdown(ctx); err != nil { t.proxy.Close() }`
+   in StopProxy (force-close the graceful-timeout remainder). Fable verified by
+   probe; Codex confirmed against net/http source.
+2. **[both] register-after-closeTunnels race.** A CONNECT that hijacked+registered
+   in the window AFTER `closeTunnels()` nil'd the map resurrected it with a
+   tunnel no stop ever closed (Codex sharpened: a handler blocked in `dial`
+   during stop registers after the sweep). Fix: `tunClosed` latch under `tunMu`
+   — `registerTunnel` now returns bool, rejects+signals-caller-to-close when
+   closing; `openTunnels()` re-arms it in StartProxy; handleConnect closes both
+   conns and abandons the relay on a false return.
+3. **[Codex] STATUS_UNAVAILABLE mislabeled a stop race.** A `status()` that fails
+   *because StopProxy closed the server* between the top `IsRunning()` check and
+   the call now (v0.3.7) read STATUS_UNAVAILABLE instead of the old NOT_RUNNING.
+   Fix: on status error, recheck `IsRunning()` → NOT_RUNNING if now stopped, else
+   STATUS_UNAVAILABLE.
+
+Everything else in the v0.3.7 diff (#3–#10: half-close, bufrw drain,
+healthNeedsRebind inversion, hop-by-hop strip, rollback-port propagation across
+StandardMessageCodec, best-effort webview, stop() finally) **both agents cleared
+explicitly** — half-close direction correct, bufrw drain preserves byte order
+(Fable probed both), Swift bool/int survive the channel as Dart bool/int, no
+lock inversion in the registry.
+
+**Verified (v0.3.8):** `go vet` + `go test -race` green (TestCloseTunnels
+extended: late-register rejected+map-not-resurrected, openTunnels re-arms);
+`flutter analyze` clean (Dart unchanged, still 35 tests); example
+`flutter build ios --simulator` links the rebuilt framework; published asset
+re-downloaded + SHA256-verified.
+
+**Released (v0.3.8):** pubspec + podspec 0.3.8, framework
+**`framework-v1.92.5-8`** (Framework.lock SHA256
+`070698ec8cec88d6d3b95ea244b84f30b5d99e369a4d11425fb1c4116b54c81f`), README
+`ref: v0.3.8`. Consumers pin `ref: v0.3.8` (supersedes v0.3.7 — same feature
+set, StopProxy lifecycle now leak-tight).
+
+**Process note worth keeping:** reviewing your OWN just-shipped diff with the
+same adversarial agents caught two real leaks the forward review couldn't (they
+were regressions the fix *introduced*). The self-review round is cheap and paid
+off — do it whenever a fix touches a concurrency/lifecycle path.
+
+### v0.3.7 (the forward-review bundle)
 
 **Ran two adversarial code reviews (Fable 5 subagent + Codex CLI) with a
 defensive-maintainer prompt, then fixed the bundle both converged on.** The

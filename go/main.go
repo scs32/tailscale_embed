@@ -131,8 +131,9 @@ type Tailscale struct {
 	// relay goroutines + fds) outlives the node it was opened under, leaking
 	// across every identity switch's StopProxy. Registered in handleConnect,
 	// closed en masse in StopProxy.
-	tunMu   sync.Mutex
-	tunnels map[*connPair]struct{}
+	tunMu     sync.Mutex
+	tunnels   map[*connPair]struct{}
+	tunClosed bool // set by closeTunnels; rejects tunnels a stop raced past
 
 	// Test seams; nil means the real rebindMagicsock / restartServer.
 	rebindFn  func(reason string)
@@ -296,6 +297,10 @@ func (t *Tailscale) StartProxy() (int, error) {
 		log.Printf("[proxy] server exited: %v", err)
 	}()
 	log.Printf("[proxy] listening on 127.0.0.1:%d", t.proxyPort)
+
+	// Re-arm the tunnel registry for this fresh lifetime (a prior StopProxy
+	// latched it closed).
+	t.openTunnels()
 
 	t.running = true
 	return t.proxyPort, nil
@@ -614,7 +619,14 @@ func (t *Tailscale) StopProxy() {
 	if t.proxy != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		t.proxy.Shutdown(ctx)
+		// Graceful first (lets short in-flight requests finish). But now that
+		// the whole-request WriteTimeout is gone, a long plain-HTTP stream
+		// (handleHTTP — NOT hijacked, so closeTunnels can't see it) would keep
+		// Shutdown blocked and outlive the node; force-close the remainder so
+		// no handler/fd/upstream conn survives the stop.
+		if err := t.proxy.Shutdown(ctx); err != nil {
+			t.proxy.Close()
+		}
 	}
 
 	if t.httpClient != nil {
@@ -684,10 +696,15 @@ func (t *Tailscale) StatusJSON() (string, error) {
 	defer cancel()
 	st, err := t.status(ctx)
 	if err != nil {
-		// The node IS running (checked above) — this is a transient
-		// LocalClient/IPC failure or the brief mid-rebind window, NOT a
-		// stopped node. Coding it NOT_RUNNING would make a status UI flash
-		// "disconnected" on a healthy node; use a distinct code.
+		// A StopProxy can land between the IsRunning() check above and this
+		// status() call, closing the server out from under us — that's a
+		// genuinely stopped node, so keep the old NOT_RUNNING coding for it.
+		// Only a status() failure on a still-running node is the transient
+		// LocalClient/IPC (or mid-rebind) case that must NOT read as
+		// "disconnected"; give that its own code.
+		if !t.IsRunning() {
+			return "", codedErr(ErrCodeNotRunning, fmt.Errorf("node stopped: %w", err))
+		}
 		return "", codedErr(ErrCodeStatusUnavailable, fmt.Errorf("status unavailable: %w", err))
 	}
 
@@ -913,13 +930,22 @@ type connPair struct {
 	dest   net.Conn
 }
 
-func (t *Tailscale) registerTunnel(p *connPair) {
+// registerTunnel records a live tunnel, returning false if the proxy is
+// stopping — a CONNECT whose dial/hijack finished in the window AFTER
+// closeTunnels swept the map would otherwise resurrect it with a tunnel no
+// stop ever closes (a leak that outlives the node). The caller must close
+// both conns and abandon the relay when this returns false.
+func (t *Tailscale) registerTunnel(p *connPair) bool {
 	t.tunMu.Lock()
+	defer t.tunMu.Unlock()
+	if t.tunClosed {
+		return false
+	}
 	if t.tunnels == nil {
 		t.tunnels = make(map[*connPair]struct{})
 	}
 	t.tunnels[p] = struct{}{}
-	t.tunMu.Unlock()
+	return true
 }
 
 func (t *Tailscale) unregisterTunnel(p *connPair) {
@@ -928,8 +954,18 @@ func (t *Tailscale) unregisterTunnel(p *connPair) {
 	t.tunMu.Unlock()
 }
 
+// openTunnels re-arms the registry for a fresh proxy lifetime (StartProxy),
+// clearing the closing flag a previous StopProxy set.
+func (t *Tailscale) openTunnels() {
+	t.tunMu.Lock()
+	t.tunClosed = false
+	t.tunMu.Unlock()
+}
+
 // closeTunnels force-closes every live hijacked tunnel, unblocking their relay
-// goroutines so they exit instead of lingering on a dead node.
+// goroutines so they exit instead of lingering on a dead node, and latches the
+// registry closed so a tunnel registering after this sweep is rejected rather
+// than stranded.
 func (t *Tailscale) closeTunnels() {
 	t.tunMu.Lock()
 	for p := range t.tunnels {
@@ -937,6 +973,7 @@ func (t *Tailscale) closeTunnels() {
 		p.dest.Close()
 	}
 	t.tunnels = nil
+	t.tunClosed = true
 	t.tunMu.Unlock()
 }
 
@@ -979,7 +1016,12 @@ func (t *Tailscale) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pair := &connPair{client: clientConn, dest: destConn}
-	t.registerTunnel(pair)
+	if !t.registerTunnel(pair) {
+		// The proxy is stopping — don't open a relay that would outlive it.
+		clientConn.Close()
+		destConn.Close()
+		return
+	}
 	defer func() {
 		t.unregisterTunnel(pair)
 		clientConn.Close()

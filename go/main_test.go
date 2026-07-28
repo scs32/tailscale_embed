@@ -381,7 +381,9 @@ func TestCloseTunnels(t *testing.T) {
 	defer c1peer.Close()
 	defer d1peer.Close()
 	p := &connPair{client: c1, dest: d1}
-	ts.registerTunnel(p)
+	if !ts.registerTunnel(p) {
+		t.Fatal("registerTunnel on an open registry should return true")
+	}
 
 	ts.tunMu.Lock()
 	n := len(ts.tunnels)
@@ -399,6 +401,32 @@ func TestCloseTunnels(t *testing.T) {
 	}
 	if ts.tunnels != nil {
 		t.Error("closeTunnels should nil the map")
+	}
+
+	// A tunnel that raced past the sweep (registers AFTER closeTunnels) must be
+	// rejected AND have its conns closed, not silently resurrect the map.
+	c2, c2peer := net.Pipe()
+	d2, d2peer := net.Pipe()
+	defer c2peer.Close()
+	defer d2peer.Close()
+	late := &connPair{client: c2, dest: d2}
+	if ts.registerTunnel(late) {
+		t.Error("registerTunnel after closeTunnels should return false")
+	}
+	if ts.tunnels != nil {
+		t.Error("a rejected register must not resurrect the map")
+	}
+	// The caller closes conns on a false return; verify the registry latched so
+	// the handler knows to. (Caller-side close is exercised in handleConnect.)
+
+	// openTunnels re-arms the registry for a fresh proxy lifetime.
+	ts.openTunnels()
+	c3, c3peer := net.Pipe()
+	d3, d3peer := net.Pipe()
+	defer c3peer.Close()
+	defer d3peer.Close()
+	if !ts.registerTunnel(&connPair{client: c3, dest: d3}) {
+		t.Error("registerTunnel after openTunnels should return true again")
 	}
 
 	// Idempotent + safe after nil-ing.
