@@ -1,4 +1,5 @@
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show PlatformException;
 
 import 'backend.dart';
 import 'config.dart';
@@ -107,7 +108,31 @@ class TailscaleEmbed {
 
   Future<int> _start() async {
     final cfg = config;
-    final port = await _backend.start(cfg);
+    final int port;
+    try {
+      port = await _backend.start(cfg);
+    } on PlatformException catch (e) {
+      // A failed start that rolled back to the previously-running identity
+      // rebinds the proxy on a NEW port (native binds 127.0.0.1:0). The
+      // pre-switch port we're still advertising is now dead, so adopt the
+      // rollback port before rethrowing — otherwise every findProxy consumer
+      // gets connection-refused until the next ensure() re-syncs.
+      final details = e.details;
+      if (details is Map && details['rolledBack'] == true) {
+        final p = details['proxyPort'];
+        if (p is int) {
+          _proxyPort.value = p;
+          if (_webViewProxy) {
+            // Best-effort: don't let a webview re-point failure mask the
+            // original start error we're about to rethrow.
+            try {
+              await _backend.installWebViewProxy(p);
+            } catch (_) {}
+          }
+        }
+      }
+      rethrow;
+    }
     await _adoptPort(port);
     // The node is up, so its persisted identity exists — the auth key (if
     // one was set) has been consumed or is no longer needed. Ephemeral
@@ -151,12 +176,28 @@ class TailscaleEmbed {
 
   Future<void> _adoptPort(int port) async {
     _proxyPort.value = port;
-    if (_webViewProxy) await _backend.installWebViewProxy(port);
+    if (_webViewProxy) {
+      // The node and proxy are up and the port is published; a webview-proxy
+      // install failure (notably iOS < 17, which returns UNSUPPORTED) must not
+      // fail the whole start — that would strand onKeyConsumed and leave a
+      // healthy tunnel looking dead. Consumers that require webview routing can
+      // call installWebViewProxy directly and handle the error.
+      try {
+        await _backend.installWebViewProxy(port);
+      } catch (e) {
+        debugPrint('tailscale_embed: WebView proxy install failed (port $port): $e');
+      }
+    }
   }
 
   Future<void> stop() => _serialized(() async {
-        await _backend.stop();
-        _proxyPort.value = null;
+        try {
+          await _backend.stop();
+        } finally {
+          // Even if native stop reported an error, the node is not left
+          // running — stop advertising a port that no longer accepts.
+          _proxyPort.value = null;
+        }
       });
 
   Future<bool> isRunning() => _backend.isRunning();

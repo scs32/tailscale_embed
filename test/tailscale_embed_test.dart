@@ -125,6 +125,51 @@ void main() {
     );
   });
 
+  test('failed start that rolled back adopts the rollback port', () async {
+    // Simulate the native rollback: the new identity failed, the previous one
+    // came back up on a fresh port carried in details. The old advertised port
+    // is dead; Dart must re-point at the rollback port before the error
+    // propagates.
+    await embed.start();
+    expect(embed.proxyPort, backend.port);
+
+    const rollbackPort = 55555;
+    backend.startError = PlatformException(
+      code: TailscaleErrorCodes.authKeyInvalid,
+      message: 'bad key',
+      details: {
+        'rolledBack': true,
+        'activeIdentity': 'default',
+        'proxyPort': rollbackPort,
+      },
+    );
+    await expectLater(
+      () => embed.start(),
+      throwsA(isA<PlatformException>()),
+    );
+    expect(embed.proxyPort, rollbackPort,
+        reason: 'should advertise the rolled-back node’s new port');
+  });
+
+  test('start succeeds even when the WebView proxy install fails', () async {
+    final wvBackend = _WebViewFailBackend();
+    String? consumed;
+    embed.configure(
+      config: () => config,
+      backend: wvBackend,
+      webViewProxy: true,
+      onKeyConsumed: (identity) => consumed = identity,
+    );
+
+    // A webview-proxy failure (e.g. iOS < 17 UNSUPPORTED) must not fail the
+    // whole start: the node is up, the port is published, the key is consumed.
+    final port = await embed.start();
+    expect(port, wvBackend.port);
+    expect(embed.proxyPort, wvBackend.port);
+    expect(consumed, 'default');
+    expect(await embed.isRunning(), isTrue);
+  });
+
   group('proxy routing (findProxy)', () {
     test('routes tailnet hosts and short names via the proxy when running',
         () async {
@@ -219,4 +264,14 @@ class _FakeSingleStore extends SingleIdentityTailscaleStore {
   String authKey = '';
   @override
   String hostname = '';
+}
+
+/// A backend whose WebView-proxy install always fails, to prove a healthy
+/// start isn't torpedoed by it (the iOS < 17 UNSUPPORTED case).
+class _WebViewFailBackend extends FakeTailscaleBackend {
+  @override
+  Future<void> installWebViewProxy(int port) async {
+    throw PlatformException(
+        code: TailscaleErrorCodes.unsupported, message: 'iOS 17 required');
+  }
 }

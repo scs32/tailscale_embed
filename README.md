@@ -68,7 +68,7 @@ dependencies:
   tailscale_embed:
     git:
       url: https://github.com/scs32/tailscale_embed.git
-      ref: v0.3.6
+      ref: v0.3.7
 ```
 
 Pin a version tag rather than `main` or a commit hash: tags communicate
@@ -190,8 +190,10 @@ names); the plugin owns the on-disk layout under
   waits and then health-checks whichever identity won.
 - **Rollback**: if a start on identity B fails (bad key, timeout), the
   previously running identity A is restarted — tunnel-up beats
-  consistency. The error's `details` map carries `rolledBack` and
-  `activeIdentity` (the identity actually running, or null).
+  consistency. The error's `details` map carries `rolledBack`,
+  `activeIdentity` (the identity actually running, or null), and the
+  `proxyPort` A rebound on (the rollback binds a fresh port; the embed
+  re-adopts it so routing keeps working, then rethrows the original error).
 - **Attribution**: `onKeyConsumed` receives the identity whose key was
   consumed (from the config the start actually used, so it's correct even
   if the provider switched mid-start). `status().identity` and

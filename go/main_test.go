@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"net/netip"
 	"strings"
 	"testing"
@@ -78,14 +81,14 @@ func TestMatchNode(t *testing.T) {
 		host string
 		want string
 	}{
-		{"truenas.tail1234.ts.net", "100.101.102.103:8080"}, // full FQDN
-		{"Truenas.Tail1234.TS.NET", "100.101.102.103:8080"}, // case-insensitive
+		{"truenas.tail1234.ts.net", "100.101.102.103:8080"},  // full FQDN
+		{"Truenas.Tail1234.TS.NET", "100.101.102.103:8080"},  // case-insensitive
 		{"truenas.tail1234.ts.net.", "100.101.102.103:8080"}, // trailing dot
-		{"truenas", "100.101.102.103:8080"},                 // MagicDNS short name
-		{"TrueNAS", "100.101.102.103:8080"},                 // bare hostname
-		{"truenas2", ""},              // no partial-label match
-		{"tail1234.ts.net", ""},       // suffix alone doesn't match
-		{"other.tail1234.ts.net", ""}, // different node
+		{"truenas", "100.101.102.103:8080"},                  // MagicDNS short name
+		{"TrueNAS", "100.101.102.103:8080"},                  // bare hostname
+		{"truenas2", ""},                                     // no partial-label match
+		{"tail1234.ts.net", ""},                              // suffix alone doesn't match
+		{"other.tail1234.ts.net", ""},                        // different node
 		{"", ""},
 	}
 	for _, tt := range tests {
@@ -186,6 +189,11 @@ func TestHealthNeedsRebind(t *testing.T) {
 		{[]string{"router: some unrelated warning"}, false},
 		{[]string{"not running"}, false}, // needs the magicsock half too
 		{[]string{"unrelated", "The MagicSock function ReceiveIPv4 is not running"}, true},
+		// A dead DERP-receive func is a relay problem, NOT a UDP-socket
+		// failure — a rebind won't fix it, so it must not trigger one.
+		{[]string{"The MagicSock function ReceiveDERP is not running"}, false},
+		{[]string{"The MagicSock function ReceiveDERP is not running",
+			"The MagicSock function ReceiveIPv4 is not running"}, true}, // IPv4 still counts
 	}
 	for _, tt := range tests {
 		if got := healthNeedsRebind(tt.health); got != tt.want {
@@ -356,6 +364,109 @@ func TestRecoveryTelemetry(t *testing.T) {
 	}
 	if snap.LastRebindAt == "" || snap.LastRestartAt == "" {
 		t.Error("timestamps should be set after record*")
+	}
+}
+
+// closeTunnels must force every registered hijacked tunnel closed (so its
+// relay goroutines unblock), be safe to call twice, and leave a nil map that
+// unregisterTunnel can still be called against without panicking.
+func TestCloseTunnels(t *testing.T) {
+	ts := &Tailscale{}
+
+	// unregister before any register (nil map) must not panic.
+	ts.unregisterTunnel(&connPair{})
+
+	c1, c1peer := net.Pipe()
+	d1, d1peer := net.Pipe()
+	defer c1peer.Close()
+	defer d1peer.Close()
+	p := &connPair{client: c1, dest: d1}
+	ts.registerTunnel(p)
+
+	ts.tunMu.Lock()
+	n := len(ts.tunnels)
+	ts.tunMu.Unlock()
+	if n != 1 {
+		t.Fatalf("registerTunnel: len(tunnels) = %d, want 1", n)
+	}
+
+	ts.closeTunnels()
+
+	// Both conns must now be closed: a Read returns an error promptly.
+	c1.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := c1.Read(make([]byte, 1)); err == nil {
+		t.Error("closeTunnels did not close the client conn")
+	}
+	if ts.tunnels != nil {
+		t.Error("closeTunnels should nil the map")
+	}
+
+	// Idempotent + safe after nil-ing.
+	ts.closeTunnels()
+	ts.unregisterTunnel(p)
+}
+
+// halfClose must signal a one-way EOF on conns that support CloseWrite and be
+// a no-op (not a panic) on those that don't.
+func TestHalfClose(t *testing.T) {
+	c, peer := net.Pipe()
+	defer c.Close()
+	defer peer.Close()
+	// net.Pipe conns don't implement CloseWrite — must not panic.
+	halfClose(c)
+
+	// A TCP conn does implement CloseWrite: after halfClose the peer reads EOF.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	done := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer conn.Close()
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, err = conn.Read(make([]byte, 1))
+		done <- err // want io.EOF once the client half-closes
+	}()
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	halfClose(client)
+	if err := <-done; err != io.EOF {
+		t.Errorf("after halfClose, peer Read err = %v, want EOF", err)
+	}
+}
+
+// removeHopHeaders must strip the standard hop-by-hop set AND any header named
+// in the Connection header, while leaving end-to-end headers intact.
+func TestRemoveHopHeaders(t *testing.T) {
+	h := http.Header{}
+	h.Set("Connection", "close, X-Custom-Hop")
+	h.Set("Keep-Alive", "timeout=5")
+	h.Set("Proxy-Connection", "keep-alive")
+	h.Set("Transfer-Encoding", "chunked")
+	h.Set("Upgrade", "websocket")
+	h.Set("X-Custom-Hop", "drop-me") // named in Connection
+	h.Set("Content-Type", "video/mp4")
+	h.Set("X-Keep", "keep-me")
+
+	removeHopHeaders(h)
+
+	for _, k := range []string{"Connection", "Keep-Alive", "Proxy-Connection",
+		"Transfer-Encoding", "Upgrade", "X-Custom-Hop"} {
+		if h.Get(k) != "" {
+			t.Errorf("hop header %q not stripped", k)
+		}
+	}
+	if h.Get("Content-Type") != "video/mp4" || h.Get("X-Keep") != "keep-me" {
+		t.Errorf("end-to-end headers must survive: %v", h)
 	}
 }
 

@@ -24,6 +24,12 @@ class TailscaleErrorCodes {
   /// The operation requires a running node.
   static const notRunning = 'NOT_RUNNING';
 
+  /// The node is running but a status read momentarily failed (transient
+  /// LocalClient/IPC error, or the brief window during a magicsock rebind).
+  /// Distinct from [notRunning]: the tunnel is up — treat as "status unknown,
+  /// retry", not "disconnected".
+  static const statusUnavailable = 'STATUS_UNAVAILABLE';
+
   /// The identity cannot be deleted because its node is currently running.
   static const identityActive = 'IDENTITY_ACTIVE';
 
@@ -87,6 +93,10 @@ class TailscaleAuthKeys {
     if (code == TailscaleErrorCodes.notRunning) {
       return 'The embedded Tailscale node is not running. Toggle it on '
           'to reconnect.';
+    }
+    if (code == TailscaleErrorCodes.statusUnavailable) {
+      return 'Tailscale status is momentarily unavailable — it should '
+          'refresh on its own.';
     }
     if (code == TailscaleErrorCodes.unsupported) {
       return 'The embedded Tailscale node is not available on this device.';

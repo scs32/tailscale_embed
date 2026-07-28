@@ -24,12 +24,13 @@ import (
 // survive the gomobile→NSError→FlutterError trip intact. The native side
 // parses the prefix into a structured error code; message text is for humans.
 const (
-	ErrCodeAuthTimeout      = "AUTH_TIMEOUT"       // control plane unreachable / Up() deadline
-	ErrCodeAuthKeyInvalid   = "AUTH_KEY_INVALID"   // key invalid, expired, or already used
-	ErrCodeAuthKeyWrongType = "AUTH_KEY_WRONG_TYPE" // API token / OAuth secret, not a node auth key
-	ErrCodeStartFailed      = "START_FAILED"        // any other tsnet startup failure
-	ErrCodeProxyBindFailed  = "PROXY_BIND_FAILED"   // couldn't bind the local proxy listener
-	ErrCodeNotRunning       = "NOT_RUNNING"         // operation requires a running node
+	ErrCodeAuthTimeout       = "AUTH_TIMEOUT"        // control plane unreachable / Up() deadline
+	ErrCodeAuthKeyInvalid    = "AUTH_KEY_INVALID"    // key invalid, expired, or already used
+	ErrCodeAuthKeyWrongType  = "AUTH_KEY_WRONG_TYPE" // API token / OAuth secret, not a node auth key
+	ErrCodeStartFailed       = "START_FAILED"        // any other tsnet startup failure
+	ErrCodeProxyBindFailed   = "PROXY_BIND_FAILED"   // couldn't bind the local proxy listener
+	ErrCodeNotRunning        = "NOT_RUNNING"         // operation requires a running node
+	ErrCodeStatusUnavailable = "STATUS_UNAVAILABLE"  // node is running but Status() momentarily failed
 )
 
 func codedErr(code string, err error) error {
@@ -77,15 +78,15 @@ const selfHealRestartInterval = 2 * time.Minute
 
 // Tailscale wraps tsnet.Server and provides an HTTP proxy for routing traffic.
 type Tailscale struct {
-	server    *tsnet.Server
-	proxy     *http.Server
+	server     *tsnet.Server
+	proxy      *http.Server
 	httpClient *http.Client // shared transport for non-CONNECT requests
-	listener  net.Listener
-	proxyPort int
-	mu        sync.Mutex
-	running   bool
-	stateDir  string
-	identity  string
+	listener   net.Listener
+	proxyPort  int
+	mu         sync.Mutex
+	running    bool
+	stateDir   string
+	identity   string
 
 	upTimeout    time.Duration
 	acceptRoutes bool
@@ -123,6 +124,15 @@ type Tailscale struct {
 
 	restartMu sync.Mutex   // serializes watchdog restarts
 	srvMu     sync.RWMutex // guards the server pointer against a mid-dial swap
+
+	// Live hijacked CONNECT tunnels. http.Server.Shutdown does NOT track or
+	// close hijacked connections, and listener.Close() doesn't touch accepted
+	// conns — so without this registry a directly-dialed tunnel (and its two
+	// relay goroutines + fds) outlives the node it was opened under, leaking
+	// across every identity switch's StopProxy. Registered in handleConnect,
+	// closed en masse in StopProxy.
+	tunMu   sync.Mutex
+	tunnels map[*connPair]struct{}
 
 	// Test seams; nil means the real rebindMagicsock / restartServer.
 	rebindFn  func(reason string)
@@ -265,11 +275,19 @@ func (t *Tailscale) StartProxy() (int, error) {
 		},
 	}
 
-	// Create HTTP proxy server
+	// Create HTTP proxy server. This is a streaming proxy: CONNECT tunnels
+	// are hijacked (deadlines cleared) but plain-HTTP transfers run through
+	// handleHTTP, and a whole-request ReadTimeout/WriteTimeout would kill any
+	// upload or download lasting longer than the deadline mid-body — a plain
+	// http:// media stream, a large offline download — even though the tunnel
+	// is healthy. Slow-loris (what those timeouts guard against) isn't in the
+	// trust model here: the listener is loopback and reached only in-process.
+	// Bound only the header read; let per-request context / client transport
+	// deadlines govern bodies, and reap idle keep-alives.
 	t.proxy = &http.Server{
-		Handler:      http.HandlerFunc(t.handleProxy),
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		Handler:           http.HandlerFunc(t.handleProxy),
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       90 * time.Second,
 	}
 
 	// Start proxy in background
@@ -433,13 +451,23 @@ func (t *Tailscale) recovery(health []string) recoverySnapshot {
 	}
 }
 
-// healthNeedsRebind reports whether any health warning says magicsock's
-// receive paths are down ("the MagicSock function ReceiveIPv4 is not
-// running", tailscale#10976 class) — the state a rebind fixes.
+// healthNeedsRebind reports whether any health warning says magicsock's UDP
+// receive path is down ("the MagicSock function ReceiveIPv4 is not running",
+// tailscale#10976 class) — the state a UDP socket rebind fixes.
+//
+// Tailscale emits the same "…is not running" template for ReceiveIPv4,
+// ReceiveIPv6, AND ReceiveDERP. Only the IPv4/IPv6 cases are UDP-socket
+// failures a Rebind()/ReSTUN() addresses; a dead DERP-receive func is a relay
+// problem that a UDP rebind won't fix, so matching it would burn a rebind (and
+// inflate the recovery telemetry the roadmap gates on) every heal interval for
+// nothing. Match the UDP receive funcs explicitly.
 func healthNeedsRebind(health []string) bool {
 	for _, w := range health {
 		lw := strings.ToLower(w)
-		if strings.Contains(lw, "magicsock") && strings.Contains(lw, "not running") {
+		if !strings.Contains(lw, "magicsock") || !strings.Contains(lw, "not running") {
+			continue
+		}
+		if strings.Contains(lw, "receiveipv4") || strings.Contains(lw, "receiveipv6") {
 			return true
 		}
 	}
@@ -597,6 +625,11 @@ func (t *Tailscale) StopProxy() {
 		t.listener.Close()
 	}
 
+	// Shutdown/listener.Close leave hijacked CONNECT tunnels open; close them
+	// so their relay goroutines and fds don't outlive this node (esp. across
+	// an identity switch's stop→start churn).
+	t.closeTunnels()
+
 	if t.server != nil {
 		t.server.Close()
 	}
@@ -651,7 +684,11 @@ func (t *Tailscale) StatusJSON() (string, error) {
 	defer cancel()
 	st, err := t.status(ctx)
 	if err != nil {
-		return "", codedErr(ErrCodeNotRunning, fmt.Errorf("status unavailable: %w", err))
+		// The node IS running (checked above) — this is a transient
+		// LocalClient/IPC failure or the brief mid-rebind window, NOT a
+		// stopped node. Coding it NOT_RUNNING would make a status UI flash
+		// "disconnected" on a healthy node; use a distinct code.
+		return "", codedErr(ErrCodeStatusUnavailable, fmt.Errorf("status unavailable: %w", err))
 	}
 
 	type node struct {
@@ -869,6 +906,50 @@ func (t *Tailscale) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// connPair is one live hijacked CONNECT tunnel: the client and destination
+// conns, tracked so StopProxy can force both closed and unblock the relay.
+type connPair struct {
+	client net.Conn
+	dest   net.Conn
+}
+
+func (t *Tailscale) registerTunnel(p *connPair) {
+	t.tunMu.Lock()
+	if t.tunnels == nil {
+		t.tunnels = make(map[*connPair]struct{})
+	}
+	t.tunnels[p] = struct{}{}
+	t.tunMu.Unlock()
+}
+
+func (t *Tailscale) unregisterTunnel(p *connPair) {
+	t.tunMu.Lock()
+	delete(t.tunnels, p) // delete on a nil map (post-closeTunnels) is a no-op
+	t.tunMu.Unlock()
+}
+
+// closeTunnels force-closes every live hijacked tunnel, unblocking their relay
+// goroutines so they exit instead of lingering on a dead node.
+func (t *Tailscale) closeTunnels() {
+	t.tunMu.Lock()
+	for p := range t.tunnels {
+		p.client.Close()
+		p.dest.Close()
+	}
+	t.tunnels = nil
+	t.tunMu.Unlock()
+}
+
+// halfClose propagates a one-directional EOF to a conn that supports it
+// (TCP/tsnet conns do). Without it, a peer that waits for its input to EOF
+// before replying can leave the opposite copy — and this handler — blocked
+// forever after the first direction drains.
+func halfClose(c net.Conn) {
+	if cw, ok := c.(interface{ CloseWrite() error }); ok {
+		cw.CloseWrite()
+	}
+}
+
 // handleConnect handles HTTPS CONNECT tunneling.
 func (t *Tailscale) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// Dial the destination — through Tailscale for tailnet hosts (resolving
@@ -881,24 +962,40 @@ func (t *Tailscale) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("[proxy] CONNECT dial %s ok", r.Host)
-	defer destConn.Close()
 
 	// Hijack the client connection
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
+		destConn.Close()
 		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
 		return
 	}
 
-	clientConn, _, err := hijacker.Hijack()
+	clientConn, bufrw, err := hijacker.Hijack()
 	if err != nil {
+		destConn.Close()
 		http.Error(w, fmt.Sprintf("hijack failed: %v", err), http.StatusInternalServerError)
 		return
 	}
-	defer clientConn.Close()
+
+	pair := &connPair{client: clientConn, dest: destConn}
+	t.registerTunnel(pair)
+	defer func() {
+		t.unregisterTunnel(pair)
+		clientConn.Close()
+		destConn.Close()
+	}()
 
 	// Send 200 Connection Established
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
+	// A client that pipelines bytes right after the CONNECT header (some TLS
+	// stacks send ClientHello without waiting for the 200) leaves them in the
+	// hijacked reader's buffer. The relay below copies from the raw conn, so
+	// forward any already-buffered bytes first or that handshake hangs.
+	if n := bufrw.Reader.Buffered(); n > 0 {
+		io.CopyN(destConn, bufrw, int64(n))
+	}
 
 	// Bidirectional copy
 	var wg sync.WaitGroup
@@ -907,14 +1004,40 @@ func (t *Tailscale) handleConnect(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer wg.Done()
 		io.Copy(destConn, clientConn)
+		halfClose(destConn)
 	}()
 
 	go func() {
 		defer wg.Done()
 		io.Copy(clientConn, destConn)
+		halfClose(clientConn)
 	}()
 
 	wg.Wait()
+}
+
+// hopByHopHeaders are per-connection headers that a proxy must not forward
+// end-to-end (RFC 7230 §6.1). Go's transport/server largely compensate, but
+// forwarding them can still confuse an upstream; strip them on both legs.
+var hopByHopHeaders = []string{
+	"Connection", "Proxy-Connection", "Keep-Alive",
+	"Proxy-Authenticate", "Proxy-Authorization",
+	"Te", "Trailer", "Transfer-Encoding", "Upgrade",
+}
+
+// removeHopHeaders strips the standard hop-by-hop headers plus any listed in
+// the Connection header, in place.
+func removeHopHeaders(h http.Header) {
+	for _, f := range h["Connection"] {
+		for _, sf := range strings.Split(f, ",") {
+			if sf = strings.TrimSpace(sf); sf != "" {
+				h.Del(sf)
+			}
+		}
+	}
+	for _, k := range hopByHopHeaders {
+		h.Del(k)
+	}
 }
 
 // handleHTTP handles regular HTTP requests (non-CONNECT).
@@ -922,6 +1045,7 @@ func (t *Tailscale) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// Create a new request to the destination
 	outReq := r.Clone(r.Context())
 	outReq.RequestURI = ""
+	removeHopHeaders(outReq.Header)
 
 	// Dial through tsnet for tailnet hosts, directly otherwise. The original
 	// Host header is left intact so the destination still sees its own name.
@@ -933,6 +1057,7 @@ func (t *Tailscale) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("[proxy] HTTP %s %s -> %d", outReq.Method, outReq.URL, resp.StatusCode)
 	defer resp.Body.Close()
+	removeHopHeaders(resp.Header)
 
 	// Copy response headers
 	for key, values := range resp.Header {

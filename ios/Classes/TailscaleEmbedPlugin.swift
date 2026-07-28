@@ -209,6 +209,7 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
                 // no tunnel at all.
                 var rolledBack = false
                 var runningIdentity: String?
+                var rolledBackPort: Int?
                 if let lastGood = self.lastGoodConfig,
                    let fallbackDir = self.stateDirectory(identity: lastGood.identity),
                    let fallback = self.makeInstance(stateDir: fallbackDir, config: lastGood) {
@@ -216,6 +217,7 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
                     if (try? fallback.startProxy(&port)) != nil {
                         rolledBack = true
                         runningIdentity = lastGood.identity
+                        rolledBackPort = port
                         DispatchQueue.main.async {
                             self.tailscale = fallback
                             self.proxyPort = port
@@ -236,6 +238,10 @@ public class TailscaleEmbedPlugin: NSObject, FlutterPlugin {
                         details: [
                             "rolledBack": rolledBack,
                             "activeIdentity": runningIdentity as Any? ?? NSNull(),
+                            // The rollback rebinds the proxy on a FRESH random
+                            // port; hand it to Dart so it re-adopts it instead
+                            // of advertising the now-dead pre-switch port.
+                            "proxyPort": rolledBackPort as Any? ?? NSNull(),
                         ]
                     ))
                 }

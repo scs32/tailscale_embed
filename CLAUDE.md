@@ -1,6 +1,98 @@
 # tailscale_embed — session notes
 
-## Guard lockup + adversarial-review session (2026-07-26, latest): v0.3.6
+## Dual-agent review + fix-bundle session (2026-07-28, latest): v0.3.7
+
+**Ran two adversarial code reviews (Fable 5 subagent + Codex CLI) with a
+defensive-maintainer prompt, then fixed the bundle both converged on.** The
+prompt was framed as hardening my own package (trust model spelled out: single
+tenant, loopback proxy, my-own-bugs not malicious-caller) — neither agent
+refused. Both independently surfaced the same **NEW High** nobody had flagged,
+which anchored the release.
+
+### Reviews (both engaged, cross-validated)
+- **Fable 5** ran the full toolchain green + wrote throwaway Go probes to prove
+  findings by *execution*. **Codex** (read-only sandbox, couldn't run tests)
+  verified by reading + checked the health-string scope against the cached
+  tailscale v1.92.5 source. Prompts saved in the session scratchpad.
+- **Headline NEW High (both):** proxy `ReadTimeout`/`WriteTimeout = 30s` armed a
+  whole-request write deadline on the non-hijacked path, so any plain-`http://`
+  transfer >30s (libmpv playback, background_downloader, large media) was killed
+  mid-body with a truncated EOF. CONNECT is hijacked so it was invisible — which
+  is why it never got pinned in the field. Fable *reproduced it* (died at exactly
+  the timeout); Codex found it by reading.
+- **Codex-only NEW Medium:** `healthNeedsRebind` matched any `magicsock`+`not
+  running`, which also catches **ReceiveDERP** → pointless UDP-rebind churn every
+  interval + inflated the recovery telemetry the #1 roadmap decision gates on.
+
+### What shipped in v0.3.7 (Go framework rebuild + Swift + Dart)
+Go (`go/main.go`, needs the framework rebuild):
+1. **Timeouts**: dropped `ReadTimeout`/`WriteTimeout`; now `ReadHeaderTimeout:30s`
+   + `IdleTimeout:90s` (slow-loris isn't in the loopback trust model).
+2. **Hijacked-tunnel registry** (`connPair`/`tunnels`/`tunMu`): register in
+   `handleConnect`, `closeTunnels()` in `StopProxy` so directly-dialed CONNECT
+   tunnels + their goroutines/fds don't outlive the node across switch churn
+   (tracked #4). Plus **half-close** (`halfClose` → `CloseWrite` after each copy
+   dir, so a peer waiting for EOF can't hang the relay) and **bufrw drain**
+   (forward bytes a client pipelined after CONNECT — Fable NEW, was a silent
+   per-conn handshake hang).
+3. **healthNeedsRebind** now requires `receiveipv4`/`receiveipv6` explicitly (not
+   DERP) — Codex NEW.
+4. **STATUS_UNAVAILABLE** new code: a running node whose `Status()` momentarily
+   fails no longer codes `NOT_RUNNING` (was flashing status UIs "disconnected").
+   Added to Dart `TailscaleErrorCodes` + `friendlyError`.
+5. **Hop-by-hop header strip** on the plain-HTTP path (`removeHopHeaders`).
+
+Swift (`ios/Classes/…`, compiled by the consumer, no framework rebuild):
+6. **Rollback port propagation** (tracked #2): rollback rebinds the proxy on a
+   fresh port; details now carry `proxyPort`.
+
+Dart (`lib/src/embed.dart`):
+7. `_start` catches the rollback `PlatformException` and **re-adopts the rollback
+   port** before rethrowing (was advertising the dead pre-switch port → silent
+   per-profile connectivity loss until next ensure()).
+8. `_adoptPort` makes the **webview-proxy install best-effort** (tracked #5): an
+   iOS<17 UNSUPPORTED no longer fails an otherwise-healthy start / strands
+   `onKeyConsumed`.
+9. `stop()` nulls `_proxyPort` in a **`finally`** (don't keep advertising a dead
+   port if native stop threw).
+
+**Verified:** `go vet` + `go test -race` green (+4 Go tests: DERP-exclusion,
+closeTunnels, halfClose, removeHopHeaders); `flutter analyze` clean; `flutter
+test` **35/35** (+2: rollback-port adoption, webview-fail-doesn't-break-start);
+example `flutter build ios --simulator` links the rebuilt framework. Published
+asset re-downloaded + SHA256-verified against the lock.
+
+**Released:** version 0.3.7 (pubspec + podspec), framework
+**`framework-v1.92.5-7`** (Framework.lock SHA256
+`94322f6af3ce22736eecc99f6aa7ad80be14d3c122ab3e469ce9310164bbd9a1`). README
+`ref: v0.3.7`, rollback doc notes the port re-adoption.
+
+### Explicitly NOT bundled (still open / deferred)
+- **Tracked #1 (queue poisoning / native `Up()` cancellation)** — both agents
+  confirmed the exact mechanics (guard frees UI at 60s, queue stays poisoned).
+  Still the big native change, still telemetry-gated. Unchanged.
+- **Main-thread block on `isRunning()` during a ~45s `Up()`** (Codex sharpened
+  tracked #6/#11): a status poll / NWPathMonitor callback blocks on Go's `t.mu`
+  which `StartProxy` holds across `Up()`. Real, but its own focused
+  Swift+Go change (needs a starting/stopping state machine or off-main
+  discipline) — not a while-I'm-here fix. Left in backlog.
+- **Rebind-races-stop telemetry noise** (tracked #9): a stop-racing rebind can
+  tick `recordRebind` on a dead node — cosmetic, noted for when #1 is scoped.
+
+### Next session, in order
+1. **Await Tailarr's v0.3.7 pickup** — they re-pin `ref: v0.3.7`, rebuild (one
+   build = timeout fix + tunnel-leak fix + rollback-port fix + telemetry
+   cleanup). Soak: the 30s plain-HTTP truncation should be gone; `restarts`
+   stays 0; DERP-only warnings no longer bump `rebinds`.
+2. Telemetry green-light for tracked #1 native `Up()` cancellation (see
+   `magicsock-receiveipv4-*` memories); if scoped, fold in #4-native + the
+   main-thread `t.mu`/`Up()` block.
+3. Real-key end-to-end (unchanged; needs user's fresh `tskey-auth-…` × 2). Sim
+   `ts-browser-test` (9540842C-9F8C-4482-B159-85E4B2BC967C) still exists.
+4. Follow up on Plezy adoption of v0.3.0 reply (not yet confirmed landed).
+5. Gap 5 ("Android + TV input", incl. QR/pairing auth) — top roadmap item.
+
+## Guard lockup + adversarial-review session (2026-07-26): v0.3.6
 
 **Fixed the consumer-reported app-wide lockup** (Tailarr build 18: a
 Delete-Profile dialog over server-owned profiles froze all input, screen
