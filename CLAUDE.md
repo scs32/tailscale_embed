@@ -49,6 +49,37 @@ couldn't. Codex twice found the subtler lifetime race Fable missed; Fable twice
 proved fixes by execution Codex couldn't run (read-only). Running both and
 requiring unanimous SHIP is the process worth keeping.
 
+### Next session, in order (authoritative as of v0.3.9)
+1. **Tailarr picks up v0.3.9.** A merge/handoff prompt was written this session
+   (scratchpad `tailarr_merge_prompt_v0.3.9.md`, not in the repo): bump
+   `ref: v0.3.5/6-era → v0.3.9`, handle the new `STATUS_UNAVAILABLE` code on the
+   Status page, confirm `proxyPortListenable` wiring for the rollback-port fix,
+   TestFlight-soak the two headline paths (30s plain-HTTP truncation gone;
+   profile-switch churn no longer leaks/wedges; a failed switch rolls back and
+   keeps working). Relay it if not already sent.
+2. **Telemetry surfacing is going to the APP side** — user is working with
+   Tailarr on how best to bubble up `status().recovery`. The embed already emits
+   needsRebind / healAttempts / rebinds / restarts + lastReason + UTC timestamps,
+   and as of v0.3.9 those counts are DERP-noise-free (trustworthy). OPEN OFFER:
+   if the app wants a field the embed doesn't emit yet — most useful would be an
+   explicit **"did the last rebind actually clear the warning" (rebind→outcome)**
+   so the next live capture directly answers "can rebind recover this?" instead
+   of inferring from counts — that's a small Dart+Go add to StatusJSON. Not built;
+   waiting on the app-side decision.
+3. **The real magicsock fix is still deferred + telemetry-gated.** NONE of
+   v0.3.7–v0.3.9 touches the dead-ReceiveIPv4-goroutine root cause (that's the
+   native `Up()`-cancellation / full server rebind — see memories
+   `magicsock-receiveipv4-rootcause`, `-live-capture`). This session only made
+   the DECISION SIGNAL clean (DERP exclusion). Green light to build it = a live
+   capture where `rebinds` climbs while traffic is genuinely dead (not just
+   DERP). Bundle with tracked #4 (hijacked-tunnel native close), #6 (sync stop on
+   platform thread) and the Codex-sharpened main-thread `t.mu`/`Up()` block if it
+   graduates.
+4. Real-key end-to-end (unchanged; needs user's fresh `tskey-auth-…` × 2). Sim
+   `ts-browser-test` (9540842C-9F8C-4482-B159-85E4B2BC967C) still exists.
+5. Follow up on Plezy adoption of v0.3.0 reply (not yet confirmed landed).
+6. Gap 5 ("Android + TV input", incl. QR/pairing auth) — top roadmap item.
+
 ### v0.3.8 — self-review of the v0.3.7 diff (both agents)
 
 ### v0.3.8 — self-review of the v0.3.7 diff (both agents, again)
