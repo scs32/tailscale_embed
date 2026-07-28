@@ -376,12 +376,15 @@ func TestCloseTunnels(t *testing.T) {
 	// unregister before any register (nil map) must not panic.
 	ts.unregisterTunnel(&connPair{})
 
+	// A fresh proxy lifetime; capture its generation like StartProxy does.
+	genA := ts.openTunnels()
+
 	c1, c1peer := net.Pipe()
 	d1, d1peer := net.Pipe()
 	defer c1peer.Close()
 	defer d1peer.Close()
 	p := &connPair{client: c1, dest: d1}
-	if !ts.registerTunnel(p) {
+	if !ts.registerTunnel(p, genA) {
 		t.Fatal("registerTunnel on an open registry should return true")
 	}
 
@@ -403,30 +406,40 @@ func TestCloseTunnels(t *testing.T) {
 		t.Error("closeTunnels should nil the map")
 	}
 
-	// A tunnel that raced past the sweep (registers AFTER closeTunnels) must be
-	// rejected AND have its conns closed, not silently resurrect the map.
+	// A tunnel that raced past the sweep (registers AFTER closeTunnels, before
+	// any restart) must be rejected AND not resurrect the map.
 	c2, c2peer := net.Pipe()
 	d2, d2peer := net.Pipe()
 	defer c2peer.Close()
 	defer d2peer.Close()
 	late := &connPair{client: c2, dest: d2}
-	if ts.registerTunnel(late) {
+	if ts.registerTunnel(late, genA) {
 		t.Error("registerTunnel after closeTunnels should return false")
 	}
 	if ts.tunnels != nil {
 		t.Error("a rejected register must not resurrect the map")
 	}
-	// The caller closes conns on a false return; verify the registry latched so
-	// the handler knows to. (Caller-side close is exercised in handleConnect.)
 
-	// openTunnels re-arms the registry for a fresh proxy lifetime.
-	ts.openTunnels()
+	// openTunnels re-arms the registry for a NEW proxy lifetime (genB != genA).
+	genB := ts.openTunnels()
+	if genB == genA {
+		t.Fatal("openTunnels must bump the generation")
+	}
+	// A straggler handler from lifetime A (descheduled across the whole
+	// stop→start) must NOT join lifetime B's registry — stale generation.
+	if ts.registerTunnel(&connPair{client: c2, dest: d2}, genA) {
+		t.Error("a stale-generation register after restart must be rejected")
+	}
+	if ts.tunnels != nil {
+		t.Error("a stale-generation register must not resurrect the map")
+	}
+	// A handler from lifetime B registers fine.
 	c3, c3peer := net.Pipe()
 	d3, d3peer := net.Pipe()
 	defer c3peer.Close()
 	defer d3peer.Close()
-	if !ts.registerTunnel(&connPair{client: c3, dest: d3}) {
-		t.Error("registerTunnel after openTunnels should return true again")
+	if !ts.registerTunnel(&connPair{client: c3, dest: d3}, genB) {
+		t.Error("registerTunnel with the current generation should return true")
 	}
 
 	// Idempotent + safe after nil-ing.

@@ -133,7 +133,11 @@ type Tailscale struct {
 	// closed en masse in StopProxy.
 	tunMu     sync.Mutex
 	tunnels   map[*connPair]struct{}
-	tunClosed bool // set by closeTunnels; rejects tunnels a stop raced past
+	tunClosed bool   // set by closeTunnels; rejects tunnels a stop raced past
+	tunGen    uint64 // proxy-lifetime generation; a tunnel registers under the
+	// generation its handler was built with, so a handler that was descheduled
+	// across a full stop→start can't register into the NEW lifetime's registry
+	// (its stale generation no longer matches).
 
 	// Test seams; nil means the real rebindMagicsock / restartServer.
 	rebindFn  func(reason string)
@@ -285,8 +289,14 @@ func (t *Tailscale) StartProxy() (int, error) {
 	// trust model here: the listener is loopback and reached only in-process.
 	// Bound only the header read; let per-request context / client transport
 	// deadlines govern bodies, and reap idle keep-alives.
+	// Re-arm the tunnel registry for this fresh lifetime (a prior StopProxy
+	// latched it closed) and capture its generation so this proxy's handlers
+	// register tunnels only into THIS lifetime.
+	gen := t.openTunnels()
 	t.proxy = &http.Server{
-		Handler:           http.HandlerFunc(t.handleProxy),
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.handleProxy(w, r, gen)
+		}),
 		ReadHeaderTimeout: 30 * time.Second,
 		IdleTimeout:       90 * time.Second,
 	}
@@ -297,10 +307,6 @@ func (t *Tailscale) StartProxy() (int, error) {
 		log.Printf("[proxy] server exited: %v", err)
 	}()
 	log.Printf("[proxy] listening on 127.0.0.1:%d", t.proxyPort)
-
-	// Re-arm the tunnel registry for this fresh lifetime (a prior StopProxy
-	// latched it closed).
-	t.openTunnels()
 
 	t.running = true
 	return t.proxyPort, nil
@@ -914,10 +920,11 @@ func (t *Tailscale) dial(ctx context.Context, network, hostport string) (net.Con
 }
 
 // handleProxy handles HTTP CONNECT requests for proxying through Tailscale.
-func (t *Tailscale) handleProxy(w http.ResponseWriter, r *http.Request) {
+// gen is the proxy lifetime this handler belongs to (see openTunnels).
+func (t *Tailscale) handleProxy(w http.ResponseWriter, r *http.Request, gen uint64) {
 	log.Printf("[proxy] %s %s (host=%s)", r.Method, r.URL, r.Host)
 	if r.Method == http.MethodConnect {
-		t.handleConnect(w, r)
+		t.handleConnect(w, r, gen)
 	} else {
 		t.handleHTTP(w, r)
 	}
@@ -935,10 +942,13 @@ type connPair struct {
 // closeTunnels swept the map would otherwise resurrect it with a tunnel no
 // stop ever closes (a leak that outlives the node). The caller must close
 // both conns and abandon the relay when this returns false.
-func (t *Tailscale) registerTunnel(p *connPair) bool {
+func (t *Tailscale) registerTunnel(p *connPair, gen uint64) bool {
 	t.tunMu.Lock()
 	defer t.tunMu.Unlock()
-	if t.tunClosed {
+	// Rejected if the registry is latched closed (a stop swept it) OR the
+	// caller's generation is stale — a handler from a prior proxy lifetime that
+	// resumed after this one re-armed must not join the new lifetime's tunnels.
+	if t.tunClosed || gen != t.tunGen {
 		return false
 	}
 	if t.tunnels == nil {
@@ -954,12 +964,17 @@ func (t *Tailscale) unregisterTunnel(p *connPair) {
 	t.tunMu.Unlock()
 }
 
-// openTunnels re-arms the registry for a fresh proxy lifetime (StartProxy),
-// clearing the closing flag a previous StopProxy set.
-func (t *Tailscale) openTunnels() {
+// openTunnels re-arms the registry for a fresh proxy lifetime (StartProxy):
+// clears the closing flag a previous StopProxy set and bumps the generation,
+// returning the new one for the handler closure to carry. Only registrations
+// stamped with this generation are accepted, so a straggler handler from the
+// previous lifetime is rejected even after the latch reopens.
+func (t *Tailscale) openTunnels() uint64 {
 	t.tunMu.Lock()
+	defer t.tunMu.Unlock()
 	t.tunClosed = false
-	t.tunMu.Unlock()
+	t.tunGen++
+	return t.tunGen
 }
 
 // closeTunnels force-closes every live hijacked tunnel, unblocking their relay
@@ -987,8 +1002,9 @@ func halfClose(c net.Conn) {
 	}
 }
 
-// handleConnect handles HTTPS CONNECT tunneling.
-func (t *Tailscale) handleConnect(w http.ResponseWriter, r *http.Request) {
+// handleConnect handles HTTPS CONNECT tunneling. gen is the proxy lifetime
+// this tunnel is registered under (rejected if the proxy stopped/restarted).
+func (t *Tailscale) handleConnect(w http.ResponseWriter, r *http.Request, gen uint64) {
 	// Dial the destination — through Tailscale for tailnet hosts (resolving
 	// MagicDNS names from the peer list; no system-wide MagicDNS on this
 	// device), directly for everything else.
@@ -1016,8 +1032,9 @@ func (t *Tailscale) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pair := &connPair{client: clientConn, dest: destConn}
-	if !t.registerTunnel(pair) {
-		// The proxy is stopping — don't open a relay that would outlive it.
+	if !t.registerTunnel(pair, gen) {
+		// The proxy is stopping, or this handler outlived its lifetime across a
+		// stop→start — don't open a relay that would outlive its node.
 		clientConn.Close()
 		destConn.Close()
 		return

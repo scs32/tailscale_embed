@@ -1,6 +1,55 @@
 # tailscale_embed — session notes
 
-## Dual-agent review + fix-bundle session (2026-07-28, latest): v0.3.7 → v0.3.8
+## Dual-agent review + fix-bundle session (2026-07-28, latest): v0.3.7 → v0.3.8 → v0.3.9
+
+### v0.3.9 — second self-review round found one more (generation-scope the tunnel latch)
+Re-reviewed the v0.3.8 diff with BOTH agents (the "did my fix regress?" pass, per
+[[self-review-shipped-diff]]). Fable cleared it; **Codex caught a real MEDIUM
+Fable missed**: the v0.3.8 `tunClosed` latch was global, not scoped to a proxy
+lifetime. A CONNECT handler descheduled right before `registerTunnel` could
+survive a full stop→start (which cleared the global latch via `openTunnels`) and
+register into the NEW lifetime's registry — the leak the latch was meant to stop,
+one boundary over.
+
+**Fix (Go-only, framework rebuild):** per-lifetime **generation**. `tunGen uint64`
+under `tunMu`; `openTunnels()` bumps it and returns the new value; `StartProxy`
+captures `gen := openTunnels()` BEFORE building `t.proxy` and wraps the handler in
+a closure carrying that gen; `handleProxy`/`handleConnect` thread it;
+`registerTunnel(p, gen)` rejects if `tunClosed || gen != tunGen`. Both conditions
+are load-bearing: `tunClosed` catches the same-lifetime stop race (gen would
+still match), the gen check catches the cross-lifetime straggler. `EnsureProxy`
+(reuses the same `t.proxy`/closure) and `restartServer` (doesn't rebuild the
+proxy) correctly keep the current gen, so healthy live traffic is never rejected;
+`StartProxy` is the ONLY `openTunnels` caller. Lock order unchanged (`t.mu` →
+`tunMu`, no inversion).
+
+**Then re-reviewed the generation fix itself with both agents → BOTH said SHIP.**
+Fable re-ran the extended `TestCloseTunnels` under `-race` (drives
+openA→register→close→register(A rejected)→openB→register(A rejected)/register(B
+ok)); Codex traced every lifecycle caller. No regressions, healthy traffic not
+rejected, uint64-overflow/gen-0 not real hazards.
+
+**Verified (v0.3.9):** `go vet` + `go test -race` green; `flutter analyze` clean
+(Dart unchanged, 35 tests); example `flutter build ios --simulator` links the
+rebuilt framework; published asset re-downloaded + SHA256-verified.
+
+**Released (v0.3.9):** pubspec + podspec 0.3.9, framework **`framework-v1.92.5-9`**
+(Framework.lock SHA256
+`77ed155e5c47a4e7c6c009c6d86c17348b9ac14c17f7c7cea6fe81dec62fe3ab`), README
+`ref: v0.3.9`. Consumers pin
+`ref: v0.3.9` (supersedes v0.3.7/v0.3.8 — same feature set, tunnel registry now
+lifetime-correct).
+
+**Loop discipline that paid off:** the user asked to keep looping review→fix→
+re-review with BOTH agents until both say ship. Round 1 (v0.3.7 forward review)
+found the fix bundle; round 2 (self-review) found 2 StopProxy holes → v0.3.8;
+round 3 (self-review of v0.3.8) found the cross-lifetime latch → v0.3.9; round 4
+(review of the generation fix) → both SHIP. Each round caught something the prior
+couldn't. Codex twice found the subtler lifetime race Fable missed; Fable twice
+proved fixes by execution Codex couldn't run (read-only). Running both and
+requiring unanimous SHIP is the process worth keeping.
+
+### v0.3.8 — self-review of the v0.3.7 diff (both agents)
 
 ### v0.3.8 — self-review of the v0.3.7 diff (both agents, again)
 After shipping v0.3.7 I ran the SAME two agents (Fable 5 subagent + Codex CLI)
